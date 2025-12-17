@@ -12,6 +12,7 @@ A key feature is the "lowest status wins" principle for state aggregation. When 
 
 *   **Job:** A unit of work identified by a unique `JobID`. A job consists of a fixed number of tasks.
 *   **Task:** A partition of a job, identified by a zero-based `TaskIndex`.
+*   **Manager Identity:** Each `Manager` instance is bound to a single task via `taskIndex` at construction time. A manager may only write states for its own task.
 *   **State:** A snapshot of a task's progress at a point in time. It is defined by the `State` struct.
 *   **Tag:** A user-defined string used to segregate different work streams or steps within a job. For example, a job might have tasks reporting status for tags like "ingest", "process", and "export".
 *   **Status:** An `int32` value representing the progress of a task for a given tag.
@@ -20,6 +21,12 @@ A key feature is the "lowest status wins" principle for state aggregation. When 
     *   `< 0`: Represents an error code.
     *   Other positive values are defined by the client application.
 *   **State Aggregation:** The process of combining states from multiple tasks to determine a single job-level state. The rule is that the lowest numerical `Status` value is the one that prevails.
+
+### 2.1 Task Isolation & Global Writes
+
+*   Managers enforce task isolation: `SetState` rejects writes where `state.TaskID` differs from the manager's `taskIndex`.
+*   Global job metadata lives in a single job document. Only task `0` performs global job writes; calls from other tasks are accepted but treated as no-ops for global updates.
+*   Cross-task writes are not allowed. Tasks communicate only by emitting their own task-tag states for others to consume.
 
 ## 3. API Definition
 
@@ -55,17 +62,25 @@ type Store interface {
     GetState(ctx context.Context, taskID int, tag string) (State, error)
     ListStatesForTag(ctx context.Context, tag string) ([]State, error)
     ListAllStates(ctx context.Context) ([]State, error)
-    Subscribe(ctx context.Context) (<-chan State, error)
+    Subscribe(ctx context.Context) (<-chan StateEvent, error)
     Close() error
 }
 
-// Manager is the main entrypoint for interacting with the state management system.
-type Manager struct {
-    // ... private fields
+// StateEvent wraps a State with delivery metadata (e.g., replay indicator).
+type StateEvent struct {
+    State  State
+    Replay bool
 }
 
-// configured with the job's authoritative number of tasks.
-func NewManager(jobID string, numTasks int, store Store) *Manager {
+// Manager is the main entrypoint for interacting with the state management system.
+// Each Manager instance is bound to a single task via taskIndex.
+type Manager struct {
+    // ... private fields
+    taskIndex int
+}
+
+// configured with the job's authoritative number of tasks and the caller's task index.
+func NewManager(jobID string, taskIndex int, numTasks int, store Store) *Manager {
     // ... implementation
 }
 
@@ -78,6 +93,7 @@ func (m *Manager) Close() error {
 }
 
 // SetState persists the state for a specific task and tag.
+// It rejects writes where state.TaskID != manager.taskIndex.
 func (m *Manager) SetState(ctx context.Context, state State) error {
     // ... implementation
 }
@@ -147,7 +163,7 @@ func (m *Manager) GetState(ctx context.Context, opts ...Option) (State, error) {
     // ... implementation
 }
 
-// Subscribe returns a channel that emits state changes.
+// Subscribe returns a channel that emits state change events.
 // The lifetime of the subscription is tied to the provided context.
 // To unsubscribe, the client must cancel the context. This will signal the
 // manager to close the channel and clean up the subscription resources.
@@ -162,15 +178,15 @@ func (m *Manager) GetState(ctx context.Context, opts ...Option) (State, error) {
 //      // handle error
 //  }
 //
-//  for state := range stateCh {
-//      fmt.Println("Received state update:", state)
-//      if state.Status == StatusFinished {
+//  for evt := range stateCh {
+//      fmt.Println("Received state update:", evt.State, "replay?", evt.Replay)
+//      if evt.State.Status == StatusFinished {
 //          cancel() // Unsubscribe and exit loop
 //      }
 //  }
 //  // The loop terminates because cancel() causes the channel to close.
 //
-func (m *Manager) Subscribe(ctx context.Context, opts ...Option) (<-chan State, error) {
+func (m *Manager) Subscribe(ctx context.Context, opts ...Option) (<-chan StateEvent, error) {
     // ... implementation
 }
 ```
@@ -211,7 +227,7 @@ While `GetState` queries the **aggregated state** (answering, "What is the overa
 
 The `Subscribe` method provides a two-phase "replay then live" model:
 
-1.  **Replay Phase (ordered snapshot)**: Upon subscription, the manager delivers a complete snapshot of the current job state that matches the subscription options. Snapshot events are sent as individual `State` objects **in ascending timestamp order (oldest to newest)** so that action replays preserve causality. The snapshot is exhaustive: e.g., with `WithTag("ingest")` and 10 tasks, the subscriber receives 10 `State` objects; missing entries are synthesized as `{tag: "ingest", taskID: 3, status: 0}` but only if at least one state exists for that tag. Snapshot events are marked so clients can distinguish replayed history from live updates.
+1.  **Replay Phase (ordered snapshot)**: Upon subscription, the manager delivers a snapshot of the current job state that matches the subscription options. Snapshot events are sent as individual `State` objects **in ascending timestamp order (oldest to newest)** so that action replays preserve causality. Snapshots include only states that actually exist; no synthesized `status: 0` entries are emitted. Snapshot events are marked so clients can distinguish replayed history from live updates.
 
 2.  **Live Phase**: After replay completes, the manager streams subsequent state changes that match the subscription options. Live updates do not reorder; they arrive as the store emits them. A sentinel message (or a documented replay-complete signal) marks the transition so clients avoid double-processing.
 
@@ -225,22 +241,22 @@ The behavior of `Subscribe` changes based on the supplied `Option`s:
 
 1.  **`Subscribe(ctx, WithTaskID(i), WithTag(t))`**:
     *   **Scope:** The single state for task `i` and tag `t`.
-    *   **Snapshot:** Delivers one `State` object (the current state or a "Not Started" default).
+    *   **Snapshot:** Delivers the current `State` if it exists; otherwise no snapshot event is emitted.
     *   **Updates:** Streams subsequent changes for that specific task and tag combination.
 
 2.  **`Subscribe(ctx, WithTag(t))`**:
     *   **Scope:** All task states for the single tag `t`.
-    *   **Snapshot:** Delivers `numTasks` `State` objects, one for each task, using defaults for any tasks without a persisted state for that tag.
+    *   **Snapshot:** Delivers one `State` per task that has written for tag `t`. Tasks with no prior writes are omitted (no synthesized defaults).
     *   **Updates:** Streams any change made to any task, as long as the change is for tag `t`.
 
 3.  **`Subscribe(ctx, WithTaskID(i))`**:
     *   **Scope:** All tag states for the single task `i`.
-    *   **Snapshot:** Delivers one `State` object for each unique tag that exists *for that task*.
+    *   **Snapshot:** Delivers one `State` object for each unique tag that exists *for that task*. Tags with no prior writes are omitted.
     *   **Updates:** Streams any change made to task `i`, regardless of the tag.
 
 4.  **`Subscribe(ctx)`**:
     *   **Scope:** Every state for every task and every tag in the entire job.
-    *   **Snapshot:** This is the most comprehensive snapshot. It determines all unique tags that exist across the entire job. Then, for each of those unique tags, it sends `numTasks` `State` objects (one for each task, with defaults where necessary).
+    *   **Snapshot:** This is the most comprehensive snapshot. It determines all unique tags that exist across the entire job. For each of those tags, it sends the states that actually exist; tasks with no writes for a tag are omitted.
     *   **Updates:** Streams every single atomic state change that occurs in the job.
 
 ## 4. Firestore Store Implementation
@@ -275,6 +291,8 @@ To ensure all managers for a given job have a consistent `numTasks` count, we'll
 *   **Document Fields:**
     *   `numTasks`: `number` (The total number of tasks/partitions for this job)
     *   `createdAt`: `timestamp`
+    *   `deleted`: `bool` (optional tombstone for cleanup/GC)
+*   **Global writes:** Only task `0` is permitted to mutate the job document; other tasks treat global writes as no-ops.
 
 #### State Documents
 
@@ -282,18 +300,19 @@ We will use a single collection for each job to hold the states. Each document i
 
 *   **Collection:** `jobs/{jobID}/states`
 *   **Document ID:** Use `{jobID}-{tag}-{taskID}` so keys remain unique even when different jobs share identical tags and task indices. This still allows simple upserts via `Set`.
+*   **Document ID:** Use `{taskID}-{tag}`. The document is already unique within the `jobs/{jobID}/states` collection path. This allows for simple upserts via `Set`.
 *   **Document Fields:**
     *   `taskID`: `number`
     *   `tag`: `string`
     *   `status`: `number`
     *   `message`: `string`
     *   `timestamp`: `timestamp` (Firestore server time; ordering/debugging)
-    *   `version`: `number` (monotonic per `{taskID, tag}`; increment each write)
-    *   `eventID`: `string` (unique per write for idempotency/dedup)
+    *   `version`: `number` (monotonic per `{taskID, tag}`; incremented on each write)
+    *   `eventID`: `string` (optional, MVP+; unique per write for idempotency/dedup)
     *   `payload`: `map` (optional tag-specific data)
     *   `schemaVersion`: `number` (default 1; supports additive schema changes)
 
-Example Document Path: `jobs/job-123/states/0-ingest`
+Example Document Path: `jobs/job-123/states/0-ingest` (with Document ID `0-ingest`)
 
 ### Caching Strategy
 
@@ -304,6 +323,12 @@ To minimize Firestore reads, the `firestoreStore` will maintain an in-memory cac
 *   **Updates:** The store will use Firestore's snapshot listeners (`Query.Snapshots`) to receive real-time updates. When a document is added, modified, or removed in the Firestore collection, the listener will receive the change and update the in-memory cache. This makes `GetState` calls extremely fast as they will primarily read from memory.
 *   **Writes:** `SetState` will write directly to Firestore. The snapshot listener will then pick up this change and update the local cache, ensuring consistency.
 
+### Listener Lifecycle and Fan-Out
+
+*   Startup: each task's store instance starts one Firestore listener when constructed. That listener covers the job and keeps the cache warm for that task process (one listener per job per task process).
+*   Fan-out: client subscriptions are served from the listener's stream; filtering is applied in the manager. This avoids multiple listeners per process while supporting many subscribers.
+*   Reconnect: on disconnect, the listener retries with exponential backoff, then refreshes the cache by re-listing states and reconciling by `Version`.
+
 ### `Subscribe` Implementation
 
 The `firestoreStore`'s `Subscribe` method will leverage the same snapshot listener used for the internal cache. When a state change is received from Firestore, it will be pushed not only to the cache but also to any active subscriber channels.
@@ -312,18 +337,19 @@ The `Manager`'s `Subscribe` method will apply the `WithTaskID` and `WithTag` fil
 
 ## 5. Reliability & Operations
 
-### Deduplication Strategy
+### Ordering, Deduplication, and Concurrency
 
-**Manager-Level Deduplication:** The manager is responsible for ensuring clients never receive duplicate states during replay or live phases:
-- Maintain a per-subscription `seenVersions` map keyed by `{taskID, tag}` → `version`.
-- During **replay**, sort states by `Timestamp` (oldest first), then emit only if `state.Version > seenVersions[key]`.
-- During **live phase**, apply the same check: emit only if `state.Version > seenVersions[key]`.
-- This guarantees clients are shielded from reprocessing duplicate replays.
+**Write Serialization:** Per `{jobID, taskID, tag}` mutexes in the store serialize writes for that key. Parallel writes to different tags are allowed.
 
-**Store-Level Deduplication:** The Firestore store uses `Version` and `EventID`:
-- `Version` is a monotonic counter per `{jobID, tag, taskID}` incremented on each write.
-- `EventID` (UUID/ULID) provides write-level idempotency; retries with the same `EventID` are no-ops.
-- On cache resync after reconnect, reconcile by keeping the highest `Version` per key.
+**Version Management:** `Version` is incremented transactionally in Firestore per `{jobID, tag, taskID}` to guarantee monotonic ordering. Clients do not set `Version`.
+
+**Idempotency (MVP vs MVP+):** For MVP, we rely on per-key serialization and versions. `EventID` support is deferred to MVP+; if added later, it will act as an optional write-level idempotency token.
+
+**Manager-Level Deduplication:** The manager keeps a per-subscription `seenVersions` map keyed by `{taskID, tag}` → `version`. During replay (sorted oldest first) and live streaming, it emits only when `state.Version` increases. This shields subscribers from duplicates.
+
+**Cache Reconcile:** On reconnect, the cache keeps the highest `Version` per key; lower versions are dropped.
+
+**Thread Safety:** In-memory cache and subscription fan-out are guarded by `sync.RWMutex` and per-subscription locks. Subscription channels are bounded (depth ≥ 4); if a subscriber cancels, pending messages may be dropped.
 
 ### Failure & Retry Semantics
 
@@ -362,6 +388,12 @@ The `Manager`'s `Subscribe` method will apply the `WithTaskID` and `WithTag` fil
 - **One Firestore per cloud project:** strict project isolation; no cross-project data sharing.
 - **IAM:** service account scoped to the job's project with minimal permissions (read/write `jobs/{jobID}` collection).
 - `projectID` is required per `NewFirestoreStore` call; never default or infer.
+
+### Cleanup and Lifecycle
+
+- Add utility functions to delete or tombstone a job (`DeleteJob` or `MarkJobDeleted`), removing the job document and associated task states or marking them for GC.
+- Define retention policy (e.g., delete jobs after configurable TTL once finished) and require appropriate IAM for cleanup operations.
+- Dashboard/monitoring consumers can subscribe in a "monitor" mode (subscribe to all tags/tasks) to display job lifecycle and status changes.
 
 ## 6. Testing Strategy
 
