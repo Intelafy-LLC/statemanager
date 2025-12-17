@@ -4,7 +4,11 @@
 
 This document outlines the design for a Go module, `statemanager`, intended to manage and synchronize state across distributed processes. The primary use case is for multi-step, partitioned jobs where each partition (task) needs to report its state and be aware of the overall job progress.
 
-The manager provides a consistent view of state for a given "job", which is composed of one or more "tasks". It uses a pluggable `Store` interface to abstract the backend data source, with the initial implementation targeting Google Firestore.
+The manager provides a consistent view of state for a given "job", which is composed of one or more "tasks". It uses a pluggable `Store` interface to abstract the backend data source. The current code ships with:
+
+* An in-memory store (default for tests).
+* A Firestore-backed store behind the `firestore` build tag (enabled with `-tags=firestore`).
+* Helper tooling: `Makefile` targets for Firestore enable/index/apply, emulator, and a migration stub (`cmd/migrate`).
 
 A key feature is the "lowest status wins" principle for state aggregation. When the state of a job or a workstream is requested, the task with the minimum status value determines the overall status, providing a clear and pessimistic view of job progress.
 
@@ -279,55 +283,32 @@ The constructor will be a standalone function that handles the "get-or-create" l
 
 The `firestoreStore` struct will hold the firestore client, the `jobID`, and the authoritative `numTasks`.
 
-### Data Model
+### Data Model (current implementation)
 
-The Firestore data model will consist of two main document types: a single Job Document to store metadata about the job, and a collection of State Documents.
+The Firestore data model consists of a job document and a collection of state documents under that job. Collection prefix defaults to `jobs` (see `defaultCollectionPrefix`).
 
 #### Job Document
 
-To ensure all managers for a given job have a consistent `numTasks` count, we'll persist it in a central document.
-
-*   **Document Path:** `jobs/{jobID}`
-*   **Document Fields:**
-    *   `numTasks`: `number` (The total number of tasks/partitions for this job)
-    *   `createdAt`: `timestamp`
-    *   `deleted`: `bool` (optional tombstone for cleanup/GC)
-*   **Global writes:** Only task `0` is permitted to mutate the job document; other tasks treat global writes as no-ops.
+* **Path:** `jobs/{jobID}`
+* **Fields:**
+    * `numTasks` (number, authoritative count persisted at creation)
+    * `deleted` (bool tombstone)
+    * `schemaVersion` (number, added by migrations when bumping schema)
+* **Behavior:** Constructor performs get-or-create; preserves existing `numTasks` if present.
 
 #### State Documents
 
-We will use a single collection for each job to hold the states. Each document in this collection will represent the state of a single task for a single tag. This model allows for efficient querying and atomic updates.
+* **Collection:** `jobs/{jobID}/states`
+* **Document ID:** `{tag}:{taskID}` (unique per job)
+* **Fields:** mirrors `State` struct: `taskID`, `tag`, `status`, `message`, `timestamp`, `version`, `eventID`, `payload`, `schemaVersion`, `jobID`.
+* **Writes:** `SetState` uses a transaction to read the prior version and set `version = prev+1`; timestamps default to `UTC` now when not provided.
+* **Reads:** Queries are direct against Firestore (no cache). Manager-level replay/live dedup uses `version`.
+* **Subscriptions:** Store uses Firestore query snapshots to stream changes; manager applies filtering, ordering, and version-based dedup on top.
 
-*   **Collection:** `jobs/{jobID}/states`
-*   **Document ID:** Use `{jobID}-{tag}-{taskID}` so keys remain unique even when different jobs share identical tags and task indices. This still allows simple upserts via `Set`.
-*   **Document ID:** Use `{taskID}-{tag}`. The document is already unique within the `jobs/{jobID}/states` collection path. This allows for simple upserts via `Set`.
-*   **Document Fields:**
-    *   `taskID`: `number`
-    *   `tag`: `string`
-    *   `status`: `number`
-    *   `message`: `string`
-    *   `timestamp`: `timestamp` (Firestore server time; ordering/debugging)
-    *   `version`: `number` (monotonic per `{taskID, tag}`; incremented on each write)
-    *   `eventID`: `string` (optional, MVP+; unique per write for idempotency/dedup)
-    *   `payload`: `map` (optional tag-specific data)
-    *   `schemaVersion`: `number` (default 1; supports additive schema changes)
+### Subscriptions (current behavior)
 
-Example Document Path: `jobs/job-123/states/0-ingest` (with Document ID `0-ingest`)
-
-### Caching Strategy
-
-To minimize Firestore reads, the `firestoreStore` will maintain an in-memory cache of the job's states.
-
-*   **Structure:** The cache will be a `map[string]State`, where the key is a composite of `taskID` and `tag`.
-*   **Initialization:** When the `firestoreStore` is created, it will perform an initial read of the entire `jobs/{jobID}/states` collection to populate the cache.
-*   **Updates:** The store will use Firestore's snapshot listeners (`Query.Snapshots`) to receive real-time updates. When a document is added, modified, or removed in the Firestore collection, the listener will receive the change and update the in-memory cache. This makes `GetState` calls extremely fast as they will primarily read from memory.
-*   **Writes:** `SetState` will write directly to Firestore. The snapshot listener will then pick up this change and update the local cache, ensuring consistency.
-
-### Listener Lifecycle and Fan-Out
-
-*   Startup: each task's store instance starts one Firestore listener when constructed. That listener covers the job and keeps the cache warm for that task process (one listener per job per task process).
-*   Fan-out: client subscriptions are served from the listener's stream; filtering is applied in the manager. This avoids multiple listeners per process while supporting many subscribers.
-*   Reconnect: on disconnect, the listener retries with exponential backoff, then refreshes the cache by re-listing states and reconciling by `Version`.
+* Each store instance establishes a Firestore snapshot stream on `states` and fans changes to subscribers.
+* The manager performs the replay+live pipeline, filtering and deduping by `{tag, taskID, version}`. No in-process cache is kept today; reads hit Firestore directly.
 
 ### `Subscribe` Implementation
 
@@ -369,19 +350,7 @@ The `Manager`'s `Subscribe` method will apply the `WithTaskID` and `WithTag` fil
 
 ### Logging
 
-**Use `log/slog`** for all structured logging:
-- Include fields: `jobID`, `tag`, `taskID`, `version`, `eventID`, `error`.
-- Prefix all error messages with "🔴 " for visibility in logs.
-- Example: `slog.Error("🔴 failed to write state", "jobID", jobID, "taskID", taskID, "error", err)`
-
-### Observability
-
-**Metrics (exportable via API, not persisted in Firestore):**
-- Cache hit rate, listener reconnect count, replay duration (ms), live delivery latency (ms).
-- Write latency/error rate, subscription channel drops (buffered messages lost on cancel).
-- Track `version` drift to detect missed updates.
-
-**No Cloud Monitoring Dependency:** Emit metrics via a lightweight HTTP endpoint (e.g., `/metrics`) or push to a pluggable backend interface. Keep implementation cloud-agnostic so the store can be swapped (e.g., AWS DynamoDB) without refactoring telemetry.
+Logging/metrics remain future work; current code does not emit structured logs or metrics.
 
 ### Security & Tenancy
 
@@ -409,24 +378,7 @@ The `Manager`'s `Subscribe` method will apply the `WithTaskID` and `WithTag` fil
 - Include `-race` detector runs for cache/subscription concurrency.
 - Mock `Store` for unit testing `Manager` aggregation logic.
 
-## 7. Implementation Plan
+## 7. Current status and gaps
 
-This design will be broken down into the following implementation steps:
-
-1.  **Define Interfaces and Structs:** Create the `statemanager.go` file with the `State` struct, `Store` interface, `Manager` struct, and `Option` types.
-2.  **Implement `Manager` shell:** Implement the `NewManager`, `SetState`, `GetState`, and `Subscribe` methods with placeholder or `panic` logic.
-3.  **Implement `GetState` Logic:** Code the full aggregation logic within the `Manager.GetState` method based on the option parameters. This logic will operate on data returned from the store.
-4.  **Implement Firestore Store:**
-    *   Create a `firestore.go` file.
-    *   Implement the `firestoreStore` struct.
-    *   Implement the `NewFirestoreStore` constructor, which will initialize the Firestore client and the snapshot listener for caching.
-    *   Implement the `SetState`, `GetState`, `ListStates...` methods with `Version`/`EventID` support.
-5.  **Add Deduplication Logic:** Implement manager-level `seenVersions` tracking in `Subscribe` for replay and live phases.
-6.  **Logging Integration:** Replace placeholder logging with `log/slog`; prefix errors with "🔴 " and warnings with "🟡 ".
-7.  **Develop Unit Tests:** Create parallel tests for each component.
-    *   Test the `Manager`'s aggregation logic using a mock `Store`.
-    *   Test the `firestoreStore` against the Firestore emulator.
-    *   Test deduplication, replay ordering, reconnect/resync scenarios.
-8.  **Add `Subscribe` functionality:** Implement the channel-based subscription logic in both the store and the manager with replay/live phase separation.
-9.  **Observability:** Add metrics endpoint and structured logging with job/tag/task context.
-10. **Refine and Document:** Add comments, examples, and finalize the public documentation.
+* Implemented: Manager aggregation, replay+live subscribe with dedup; in-memory store; Firestore store (build tag); helper scripts and Make targets; migration stub.
+* Not yet implemented: structured logging/metrics; Firestore emulator tests; advanced schema migrations beyond stamping `schemaVersion` on job docs.
