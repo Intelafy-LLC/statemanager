@@ -1,0 +1,27 @@
+{
+    "indexes": [
+        {
+            "collectionGroup": "states",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {
+                    "fieldPath": "jobID",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "tag",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "taskID",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "version",
+                    "order": "DESCENDING"
+                }
+            ]
+        }
+    ],
+    "fieldOverrides": []
+}
