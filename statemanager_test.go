@@ -71,6 +71,79 @@ func TestSetStateRejectsOtherTask(t *testing.T) {
 	}
 }
 
+func TestSynchronizeSuccess(t *testing.T) {
+	backend := NewInMemoryStore()
+	mgr0, err := NewManagerForNewJob(context.Background(), backend, "job-sync-ok", 0, 2)
+	if err != nil {
+		t.Fatalf("manager0 create failed: %v", err)
+	}
+	mgr1, err := NewManagerForExistingJob(context.Background(), backend, "job-sync-ok", 1)
+	if err != nil {
+		t.Fatalf("manager1 open failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_ = mgr0.SetState(context.Background(), State{JobID: "job-sync-ok", TaskID: 0, Tag: "startup", Status: 10})
+		_ = mgr1.SetState(context.Background(), State{JobID: "job-sync-ok", TaskID: 1, Tag: "startup", Status: 10})
+		close(done)
+	}()
+
+	states, err := mgr0.Synchronize(ctx, "startup", 10)
+	if err != nil {
+		t.Fatalf("synchronize failed: %v", err)
+	}
+	<-done
+	if len(states) != 2 {
+		t.Fatalf("expected 2 states, got %d", len(states))
+	}
+	for i, st := range states {
+		if st.Status < 10 {
+			t.Fatalf("task %d status below target: %d", i, st.Status)
+		}
+		if st.Tag != "startup" {
+			t.Fatalf("task %d unexpected tag: %s", i, st.Tag)
+		}
+	}
+}
+
+func TestSynchronizeTimeoutReturnsPartial(t *testing.T) {
+	backend := NewInMemoryStore()
+	mgr0, err := NewManagerForNewJob(context.Background(), backend, "job-sync-timeout", 0, 2)
+	if err != nil {
+		t.Fatalf("manager0 create failed: %v", err)
+	}
+	mgr1, err := NewManagerForExistingJob(context.Background(), backend, "job-sync-timeout", 1)
+	if err != nil {
+		t.Fatalf("manager1 open failed: %v", err)
+	}
+
+	// Only one task reaches the target.
+	if err := mgr0.SetState(context.Background(), State{JobID: "job-sync-timeout", TaskID: 0, Tag: "startup", Status: 10}); err != nil {
+		t.Fatalf("set state task0 failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	states, err := mgr1.Synchronize(ctx, "startup", 10)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+	if len(states) != 2 {
+		t.Fatalf("expected 2 states, got %d", len(states))
+	}
+	if states[0].Status < 10 {
+		t.Fatalf("task0 status should be at least target, got %d", states[0].Status)
+	}
+	if states[1].Status != 0 {
+		t.Fatalf("task1 should be defaulted to 0 when missing, got %d", states[1].Status)
+	}
+}
+
 func TestGetStateAggregations(t *testing.T) {
 	for _, f := range defaultStores {
 		t.Run(f.name, func(t *testing.T) {

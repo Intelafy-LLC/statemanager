@@ -137,6 +137,14 @@ func (m *Manager) GetState(ctx context.Context, opts ...Option) (State, error) {
     // ... implementation
 }
 
+// Synchronize waits until every task reaches at least targetStatus for the given tag,
+// or the context expires. It returns a slice of length numTasks containing the latest
+// observed state per task (missing tasks are defaulted) plus any error (including
+// context cancellation/timeout).
+func (m *Manager) Synchronize(ctx context.Context, tag string, targetStatus int32) ([]State, error) {
+    // ... implementation
+}
+
 // Subscribe returns a channel that emits state change events.
 // The lifetime of the subscription is tied to the provided context.
 // To unsubscribe, the client must cancel the context. This will signal the

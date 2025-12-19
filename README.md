@@ -14,6 +14,8 @@ go test ./...
 
 Managers enforce task isolation: a manager only writes for its bound `TaskIndex`. Aggregations return the lowest status across the scoped tasks/tags. Managers are constructed via lifecycle-aware helpers: `NewManagerForNewJob(ctx, store, jobID, taskIndex, numTasks)` to create, or `NewManagerForExistingJob(ctx, store, jobID, taskIndex)` to open.
 
+For reruns that reuse a `jobID` but need fresh barriers, supply a run token at the client level and choose a tag naming convention (e.g., `startup:<token>`); the state manager stays agnostic.
+
 ## Firestore-backed usage
 
 Makefile targets (require `gcloud`):

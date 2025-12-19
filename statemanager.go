@@ -381,6 +381,65 @@ func matchesOptions(st State, qo *queryOptions) bool {
 	return true
 }
 
+// Synchronize waits until all tasks have reached at least targetStatus for the given tag
+// or the context expires. It returns a slice of length NumTasks containing the latest
+// observed state per task (missing tasks are defaulted) and any error (including context
+// timeout/cancellation).
+func (m *Manager) Synchronize(ctx context.Context, tag string, targetStatus int32) ([]State, error) {
+	ctxSub, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	states := make([]State, m.numTasks)
+	for i := 0; i < m.numTasks; i++ {
+		states[i] = State{JobID: m.jobID, TaskID: i, Tag: tag, Status: 0}
+	}
+
+	completed := func() bool {
+		for i := 0; i < m.numTasks; i++ {
+			if states[i].Status < targetStatus {
+				return false
+			}
+		}
+		return true
+	}
+
+	seed, err := m.store.ListStatesForTag(ctxSub, tag)
+	if err != nil {
+		return nil, err
+	}
+	for _, st := range seed {
+		if st.TaskID >= 0 && st.TaskID < m.numTasks {
+			states[st.TaskID] = st
+		}
+	}
+	if completed() {
+		return states, nil
+	}
+
+	ch, err := m.Subscribe(ctxSub, WithTag(tag))
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		select {
+		case <-ctxSub.Done():
+			return states, ctx.Err()
+		case evt, ok := <-ch:
+			if !ok {
+				return states, ctx.Err()
+			}
+			st := evt.State
+			if st.TaskID >= 0 && st.TaskID < m.numTasks {
+				states[st.TaskID] = st
+				if completed() {
+					return states, nil
+				}
+			}
+		}
+	}
+}
+
 // stateKey builds a key for deduplication per task+tag.
 func stateKey(st State) string {
 	return st.Tag + ":" + strconv.Itoa(st.TaskID)
