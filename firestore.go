@@ -1,6 +1,3 @@
-//go:build firestore
-// +build firestore
-
 package statemanager
 
 import (
@@ -20,11 +17,16 @@ const defaultCollectionPrefix = "jobs"
 
 // firestoreStore is a Firestore-backed implementation of Store scoped to a single job.
 type firestoreStore struct {
-	client   *firestore.Client
-	jobDoc   *firestore.DocumentRef
-	states   *firestore.CollectionRef
-	jobID    string
+	projectID        string
+	collectionPrefix string
+
+	client *firestore.Client
+	jobDoc *firestore.DocumentRef
+	states *firestore.CollectionRef
+	jobID  string
+
 	numTasks int
+	bound    bool
 
 	mu          sync.Mutex
 	subscribers map[chan StateEvent]context.CancelFunc
@@ -34,18 +36,24 @@ type firestoreStore struct {
 // Ensure firestoreStore implements optional Cleaner interface.
 var _ Cleaner = (*firestoreStore)(nil)
 
-// NewFirestoreStore constructs a Firestore store for a job, returning the authoritative numTasks.
-// It will create the job document if missing and preserve an existing numTasks if already set.
-func NewFirestoreStore(ctx context.Context, projectID, jobID string, numTasks int) (Store, int, error) {
-	client, err := firestore.NewClient(ctx, projectID)
+// NewFirestoreStore constructs an unbound Firestore backend.
+func NewFirestoreStore(projectID string) Store {
+	return &firestoreStore{projectID: projectID, collectionPrefix: defaultCollectionPrefix}
+}
+
+// NewJob creates a Firestore job and returns a job-scoped store.
+func (f *firestoreStore) NewJob(ctx context.Context, jobID string, numTasks int) (Store, int, error) {
+	if numTasks <= 0 {
+		return nil, 0, ErrNotSupported
+	}
+	client, err := firestore.NewClient(ctx, f.projectID)
 	if err != nil {
 		return nil, 0, fmt.Errorf("new firestore client: %w", err)
 	}
 
-	jobDoc := client.Collection(defaultCollectionPrefix).Doc(jobID)
+	jobDoc := client.Collection(f.collectionPrefix).Doc(jobID)
 	states := jobDoc.Collection("states")
 
-	resolvedNumTasks := numTasks
 	err = client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
 		snap, err := tx.Get(jobDoc)
 		if err != nil {
@@ -57,14 +65,8 @@ func NewFirestoreStore(ctx context.Context, projectID, jobID string, numTasks in
 				"deleted":  false,
 			})
 		}
-		var job struct {
-			NumTasks int `firestore:"numTasks"`
-		}
-		if err := snap.DataTo(&job); err != nil {
-			return err
-		}
-		if job.NumTasks > 0 {
-			resolvedNumTasks = job.NumTasks
+		if snap.Exists() {
+			return ErrNotSupported
 		}
 		return nil
 	})
@@ -74,19 +76,70 @@ func NewFirestoreStore(ctx context.Context, projectID, jobID string, numTasks in
 	}
 
 	fs := &firestoreStore{
-		client:      client,
-		jobDoc:      jobDoc,
-		states:      states,
-		jobID:       jobID,
-		numTasks:    resolvedNumTasks,
-		subscribers: make(map[chan StateEvent]context.CancelFunc),
+		projectID:        f.projectID,
+		collectionPrefix: f.collectionPrefix,
+		client:           client,
+		jobDoc:           jobDoc,
+		states:           states,
+		jobID:            jobID,
+		numTasks:         numTasks,
+		bound:            true,
+		subscribers:      make(map[chan StateEvent]context.CancelFunc),
 	}
 
-	return fs, resolvedNumTasks, nil
+	return fs, numTasks, nil
+}
+
+// OpenJob opens an existing Firestore job and returns a job-scoped store.
+func (f *firestoreStore) OpenJob(ctx context.Context, jobID string) (Store, int, error) {
+	client, err := firestore.NewClient(ctx, f.projectID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("new firestore client: %w", err)
+	}
+
+	jobDoc := client.Collection(f.collectionPrefix).Doc(jobID)
+	states := jobDoc.Collection("states")
+
+	snap, err := jobDoc.Get(ctx)
+	if err != nil {
+		_ = client.Close()
+		if status.Code(err) == codes.NotFound {
+			return nil, 0, ErrNotFound
+		}
+		return nil, 0, fmt.Errorf("get job doc: %w", err)
+	}
+	var job struct {
+		NumTasks int `firestore:"numTasks"`
+	}
+	if err := snap.DataTo(&job); err != nil {
+		_ = client.Close()
+		return nil, 0, fmt.Errorf("parse job doc: %w", err)
+	}
+	if job.NumTasks <= 0 {
+		_ = client.Close()
+		return nil, 0, fmt.Errorf("job %s has invalid numTasks %d", jobID, job.NumTasks)
+	}
+
+	fs := &firestoreStore{
+		projectID:        f.projectID,
+		collectionPrefix: f.collectionPrefix,
+		client:           client,
+		jobDoc:           jobDoc,
+		states:           states,
+		jobID:            jobID,
+		numTasks:         job.NumTasks,
+		bound:            true,
+		subscribers:      make(map[chan StateEvent]context.CancelFunc),
+	}
+
+	return fs, job.NumTasks, nil
 }
 
 // SetState writes a state using a transaction to bump version per {tag,task} key.
 func (f *firestoreStore) SetState(ctx context.Context, state State) error {
+	if !f.bound {
+		return ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -120,6 +173,9 @@ func (f *firestoreStore) SetState(ctx context.Context, state State) error {
 
 // GetState reads a single state.
 func (f *firestoreStore) GetState(ctx context.Context, taskID int, tag string) (State, error) {
+	if !f.bound {
+		return State{}, ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return State{}, ctx.Err()
@@ -142,6 +198,9 @@ func (f *firestoreStore) GetState(ctx context.Context, taskID int, tag string) (
 
 // ListStatesForTag lists states for a tag.
 func (f *firestoreStore) ListStatesForTag(ctx context.Context, tag string) ([]State, error) {
+	if !f.bound {
+		return nil, ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -170,6 +229,9 @@ func (f *firestoreStore) ListStatesForTag(ctx context.Context, tag string) ([]St
 
 // ListAllStates lists all states for this job.
 func (f *firestoreStore) ListAllStates(ctx context.Context) ([]State, error) {
+	if !f.bound {
+		return nil, ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -198,6 +260,9 @@ func (f *firestoreStore) ListAllStates(ctx context.Context) ([]State, error) {
 
 // Subscribe registers a new subscriber and streams live updates via query snapshots.
 func (f *firestoreStore) Subscribe(ctx context.Context) (<-chan StateEvent, error) {
+	if !f.bound {
+		return nil, ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -226,7 +291,7 @@ func (f *firestoreStore) Subscribe(ctx context.Context) (<-chan StateEvent, erro
 				return
 			}
 			for _, change := range snap.Changes {
-				if change.Kind == firestore.Removed {
+				if change.Kind == firestore.DocumentRemoved {
 					continue
 				}
 				var st State
@@ -247,6 +312,9 @@ func (f *firestoreStore) Subscribe(ctx context.Context) (<-chan StateEvent, erro
 
 // Close closes subscriptions and the underlying Firestore client.
 func (f *firestoreStore) Close() error {
+	if !f.bound {
+		return nil
+	}
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
@@ -263,6 +331,9 @@ func (f *firestoreStore) Close() error {
 
 // DeleteJob removes job metadata and task states.
 func (f *firestoreStore) DeleteJob(ctx context.Context) error {
+	if !f.bound {
+		return ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -288,6 +359,9 @@ func (f *firestoreStore) DeleteJob(ctx context.Context) error {
 
 // MarkJobDeleted tombstones a job for GC.
 func (f *firestoreStore) MarkJobDeleted(ctx context.Context) error {
+	if !f.bound {
+		return ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()

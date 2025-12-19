@@ -8,9 +8,17 @@ import (
 )
 
 // inMemoryStore is an in-memory implementation of Store.
-// It is intended for local testing and validation of Manager behavior.
+// A root instance manages jobs; job-scoped instances operate on a single job.
 type inMemoryStore struct {
-	jobID    string
+	root  *inMemoryStore
+	job   *inMemoryJob
+	jobID string
+
+	mu   sync.Mutex // protects jobs map (root only)
+	jobs map[string]*inMemoryJob
+}
+
+type inMemoryJob struct {
 	numTasks int
 
 	mu          sync.RWMutex
@@ -18,10 +26,6 @@ type inMemoryStore struct {
 	versions    map[string]int64
 	subscribers map[chan StateEvent]struct{}
 	closed      bool
-
-	updates chan StateEvent // legacy broadcast channel (kept for simplicity)
-
-	stop func()
 }
 
 // Ensure inMemoryStore implements Store and Cleaner interfaces.
@@ -30,24 +34,55 @@ var (
 	_ Cleaner = (*inMemoryStore)(nil)
 )
 
-// NewInMemoryStore constructs an in-memory store for a job, returning the authoritative numTasks.
-func NewInMemoryStore(ctx context.Context, jobID string, numTasks int) (Store, int, error) {
-	_ = ctx
+// NewInMemoryStore constructs an unbound in-memory store backend.
+func NewInMemoryStore() Store {
+	root := &inMemoryStore{}
+	root.root = root
+	root.jobs = make(map[string]*inMemoryJob)
+	return root
+}
 
-	s := &inMemoryStore{
-		jobID:       jobID,
+// NewJob creates a job and returns a job-scoped store.
+func (s *inMemoryStore) NewJob(ctx context.Context, jobID string, numTasks int) (Store, int, error) {
+	_ = ctx
+	if numTasks <= 0 {
+		return nil, 0, ErrNotSupported
+	}
+	root := s.rootStore()
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	if _, exists := root.jobs[jobID]; exists {
+		return nil, 0, ErrNotSupported
+	}
+	job := &inMemoryJob{
 		numTasks:    numTasks,
 		cache:       make(map[string]State),
 		versions:    make(map[string]int64),
 		subscribers: make(map[chan StateEvent]struct{}),
-		updates:     make(chan StateEvent, 16),
 	}
+	root.jobs[jobID] = job
+	return &inMemoryStore{root: root, job: job, jobID: jobID}, numTasks, nil
+}
 
-	return s, numTasks, nil
+// OpenJob opens an existing job.
+func (s *inMemoryStore) OpenJob(ctx context.Context, jobID string) (Store, int, error) {
+	_ = ctx
+	root := s.rootStore()
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	job, ok := root.jobs[jobID]
+	if !ok {
+		return nil, 0, ErrNotFound
+	}
+	return &inMemoryStore{root: root, job: job, jobID: jobID}, job.numTasks, nil
 }
 
 // SetState writes a state, bumping version per {tag,task} key.
 func (s *inMemoryStore) SetState(ctx context.Context, state State) error {
+	job := s.job
+	if job == nil {
+		return ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -56,22 +91,21 @@ func (s *inMemoryStore) SetState(ctx context.Context, state State) error {
 
 	key := stateKey(state)
 
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	job.mu.Lock()
+	if job.closed {
+		job.mu.Unlock()
 		return ErrNotSupported
 	}
-	prevVer := s.versions[key]
+	prevVer := job.versions[key]
 	state.Version = prevVer + 1
 	if state.Timestamp.IsZero() {
 		state.Timestamp = time.Now().UTC()
 	}
-	s.cache[key] = state
-	s.versions[key] = state.Version
-	subs := s.copySubscribersLocked()
-	s.mu.Unlock()
+	job.cache[key] = state
+	job.versions[key] = state.Version
+	subs := copySubscribers(job.subscribers)
+	job.mu.Unlock()
 
-	// Broadcast to subscribers; block unless context is cancelled to avoid message loss.
 	for ch := range subs {
 		select {
 		case <-ctx.Done():
@@ -85,15 +119,19 @@ func (s *inMemoryStore) SetState(ctx context.Context, state State) error {
 
 // GetState reads a single state.
 func (s *inMemoryStore) GetState(ctx context.Context, taskID int, tag string) (State, error) {
+	job := s.job
+	if job == nil {
+		return State{}, ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return State{}, ctx.Err()
 	default:
 	}
 	key := tag + ":" + strconv.Itoa(taskID)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	st, ok := s.cache[key]
+	job.mu.RLock()
+	defer job.mu.RUnlock()
+	st, ok := job.cache[key]
 	if !ok {
 		return State{}, ErrNotFound
 	}
@@ -102,15 +140,19 @@ func (s *inMemoryStore) GetState(ctx context.Context, taskID int, tag string) (S
 
 // ListStatesForTag lists states for a tag.
 func (s *inMemoryStore) ListStatesForTag(ctx context.Context, tag string) ([]State, error) {
+	job := s.job
+	if job == nil {
+		return nil, ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	job.mu.RLock()
+	defer job.mu.RUnlock()
 	out := make([]State, 0)
-	for _, st := range s.cache {
+	for _, st := range job.cache {
 		if st.Tag == tag {
 			out = append(out, st)
 		}
@@ -120,15 +162,19 @@ func (s *inMemoryStore) ListStatesForTag(ctx context.Context, tag string) ([]Sta
 
 // ListAllStates lists all states.
 func (s *inMemoryStore) ListAllStates(ctx context.Context) ([]State, error) {
+	job := s.job
+	if job == nil {
+		return nil, ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]State, 0, len(s.cache))
-	for _, st := range s.cache {
+	job.mu.RLock()
+	defer job.mu.RUnlock()
+	out := make([]State, 0, len(job.cache))
+	for _, st := range job.cache {
 		out = append(out, st)
 	}
 	return out, nil
@@ -136,6 +182,10 @@ func (s *inMemoryStore) ListAllStates(ctx context.Context) ([]State, error) {
 
 // Subscribe registers a new subscriber and returns its channel.
 func (s *inMemoryStore) Subscribe(ctx context.Context) (<-chan StateEvent, error) {
+	job := s.job
+	if job == nil {
+		return nil, ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -143,21 +193,20 @@ func (s *inMemoryStore) Subscribe(ctx context.Context) (<-chan StateEvent, error
 	}
 
 	ch := make(chan StateEvent, 16)
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	job.mu.Lock()
+	if job.closed {
+		job.mu.Unlock()
 		return nil, ErrNotSupported
 	}
-	s.subscribers[ch] = struct{}{}
-	s.mu.Unlock()
+	job.subscribers[ch] = struct{}{}
+	job.mu.Unlock()
 
-	// Unregister on context cancel.
 	go func() {
 		<-ctx.Done()
-		s.mu.Lock()
-		delete(s.subscribers, ch)
+		job.mu.Lock()
+		delete(job.subscribers, ch)
 		close(ch)
-		s.mu.Unlock()
+		job.mu.Unlock()
 	}()
 
 	return ch, nil
@@ -165,34 +214,39 @@ func (s *inMemoryStore) Subscribe(ctx context.Context) (<-chan StateEvent, error
 
 // Close stops the store and closes internal channels.
 func (s *inMemoryStore) Close() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	job := s.job
+	if job == nil {
 		return nil
 	}
-	s.closed = true
-	if s.stop != nil {
-		s.stop()
+	job.mu.Lock()
+	if job.closed {
+		job.mu.Unlock()
+		return nil
 	}
-	for ch := range s.subscribers {
+	job.closed = true
+	for ch := range job.subscribers {
 		close(ch)
 	}
-	s.subscribers = nil
-	s.mu.Unlock()
+	job.subscribers = nil
+	job.mu.Unlock()
 	return nil
 }
 
 // DeleteJob removes job metadata and task states.
 func (s *inMemoryStore) DeleteJob(ctx context.Context) error {
+	job := s.job
+	if job == nil {
+		return ErrNotSupported
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
-	s.mu.Lock()
-	s.cache = make(map[string]State)
-	s.versions = make(map[string]int64)
-	s.mu.Unlock()
+	job.mu.Lock()
+	job.cache = make(map[string]State)
+	job.versions = make(map[string]int64)
+	job.mu.Unlock()
 	return nil
 }
 
@@ -201,10 +255,16 @@ func (s *inMemoryStore) MarkJobDeleted(ctx context.Context) error {
 	return s.DeleteJob(ctx)
 }
 
-// copySubscribersLocked returns a shallow copy of current subscribers. Caller must hold s.mu.
-func (s *inMemoryStore) copySubscribersLocked() map[chan StateEvent]struct{} {
-	copy := make(map[chan StateEvent]struct{}, len(s.subscribers))
-	for ch := range s.subscribers {
+func (s *inMemoryStore) rootStore() *inMemoryStore {
+	if s.root != nil {
+		return s.root
+	}
+	return s
+}
+
+func copySubscribers(src map[chan StateEvent]struct{}) map[chan StateEvent]struct{} {
+	copy := make(map[chan StateEvent]struct{}, len(src))
+	for ch := range src {
 		copy[ch] = struct{}{}
 	}
 	return copy

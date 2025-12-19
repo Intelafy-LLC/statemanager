@@ -10,16 +10,16 @@ import (
 
 // State represents the status of a single task for a specific tag.
 type State struct {
-	JobID         string
-	TaskID        int
-	Tag           string
-	Status        int32
-	Message       string
-	Timestamp     time.Time
-	Version       int64          // monotonic per {JobID, Tag, TaskID}; used for ordering and dedup
-	EventID       string         // optional (MVP+): unique per write; idempotency token
-	Payload       map[string]any // optional tag-specific data
-	SchemaVersion int            // schema version of the payload/state
+	JobID         string         `slog:"jobID"`
+	TaskID        int            `slog:"taskID"`
+	Tag           string         `slog:"tag"`
+	Status        int32          `slog:"status"`
+	Message       string         `slog:"message"`
+	Timestamp     time.Time      `slog:"timestamp"`
+	Version       int64          `slog:"version"`       // monotonic per {JobID, Tag, TaskID}; used for ordering and dedup
+	EventID       string         `slog:"eventID"`       // optional (MVP+): unique per write; idempotency token
+	Payload       map[string]any `slog:"payload"`       // optional tag-specific data
+	SchemaVersion int            `slog:"schemaVersion"` // schema version of the payload/state
 }
 
 // StateEvent wraps a State with delivery metadata (e.g., replay indicator).
@@ -37,9 +37,19 @@ var (
 	ErrNotImplemented = errors.New("not implemented")
 )
 
-// Store is the interface for backend data storage. A Store instance is scoped
-// to a single job.
+// Store abstracts backend access and job lifecycle.
+//
+// Unbound usage: call NewJob (create, fail if exists) or OpenJob (open, fail if missing)
+// to obtain a job-scoped Store. Job-scoped instances implement the same interface; calling
+// job operations on an unbound instance should return ErrNotSupported.
 type Store interface {
+	// NewJob creates a job and returns a job-scoped Store plus the authoritative numTasks.
+	// It must fail if the job already exists or numTasks <= 0.
+	NewJob(ctx context.Context, jobID string, numTasks int) (Store, int, error)
+	// OpenJob opens an existing job and returns a job-scoped Store plus the authoritative numTasks.
+	// It must fail if the job does not exist.
+	OpenJob(ctx context.Context, jobID string) (Store, int, error)
+
 	SetState(ctx context.Context, state State) error
 	GetState(ctx context.Context, taskID int, tag string) (State, error)
 	ListStatesForTag(ctx context.Context, tag string) ([]State, error)
@@ -78,16 +88,32 @@ func (m *Manager) NumTasks() int {
 	return m.numTasks
 }
 
-// NewManager creates a new state manager. The numTasks parameter is the expected
-// number of tasks for the job. If the job already exists in the store, the
-// stored value for numTasks will be used.
-func NewManager(jobID string, taskIndex int, numTasks int, store Store) *Manager {
+// NewManagerForNewJob creates the job (failing if it already exists) and binds a manager to it.
+func NewManagerForNewJob(ctx context.Context, store Store, jobID string, taskIndex int, numTasks int) (*Manager, error) {
+	jobStore, resolved, err := store.NewJob(ctx, jobID, numTasks)
+	if err != nil {
+		return nil, err
+	}
 	return &Manager{
 		jobID:     jobID,
 		taskIndex: taskIndex,
-		numTasks:  numTasks,
-		store:     store,
+		numTasks:  resolved,
+		store:     jobStore,
+	}, nil
+}
+
+// NewManagerForExistingJob opens an existing job (failing if missing) and binds a manager to it.
+func NewManagerForExistingJob(ctx context.Context, store Store, jobID string, taskIndex int) (*Manager, error) {
+	jobStore, resolved, err := store.OpenJob(ctx, jobID)
+	if err != nil {
+		return nil, err
 	}
+	return &Manager{
+		jobID:     jobID,
+		taskIndex: taskIndex,
+		numTasks:  resolved,
+		store:     jobStore,
+	}, nil
 }
 
 // Close gracefully shuts down the manager. It closes all active subscription

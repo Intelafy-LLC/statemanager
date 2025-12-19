@@ -1,6 +1,3 @@
-//go:build firestore
-// +build firestore
-
 package main
 
 import (

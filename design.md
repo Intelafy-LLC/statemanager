@@ -4,10 +4,10 @@
 
 This document outlines the design for a Go module, `statemanager`, intended to manage and synchronize state across distributed processes. The primary use case is for multi-step, partitioned jobs where each partition (task) needs to report its state and be aware of the overall job progress.
 
-The manager provides a consistent view of state for a given "job", which is composed of one or more "tasks". It uses a pluggable `Store` interface to abstract the backend data source. The current code ships with:
+The manager provides a consistent view of state for a given "job", which is composed of one or more "tasks". It uses a pluggable `Store` interface to abstract the backend data source. A `Store` starts as an unbound backend; jobs are created or opened explicitly via lifecycle methods before any state operations. The current code ships with:
 
 * An in-memory store (default for tests).
-* A Firestore-backed store behind the `firestore` build tag (enabled with `-tags=firestore`).
+* A Firestore-backed store.
 * Helper tooling: `Makefile` targets for Firestore enable/index/apply, emulator, and a migration stub (`cmd/migrate`).
 
 A key feature is the "lowest status wins" principle for state aggregation. When the state of a job or a workstream is requested, the task with the minimum status value determines the overall status, providing a clear and pessimistic view of job progress.
@@ -59,9 +59,15 @@ type State struct {
 // Clients should treat them as authoritative and not adjust for local clock skew.
 // Version/EventID are used to deduplicate replays and reconcile after reconnects.
 
-// Store is the interface for backend data storage. A Store instance is scoped
-// to a single job.
+// Store is an unbound backend that can create or open jobs, returning job-scoped stores.
+// Job-scoped instances implement the same interface; job operations on an unbound instance
+// must return ErrNotSupported.
 type Store interface {
+    // Lifecycle
+    NewJob(ctx context.Context, jobID string, numTasks int) (Store, int, error) // create; fail if exists or numTasks <= 0
+    OpenJob(ctx context.Context, jobID string) (Store, int, error)              // open; fail if missing
+
+    // Job-scoped operations (valid only on bound instances)
     SetState(ctx context.Context, state State) error
     GetState(ctx context.Context, taskID int, tag string) (State, error)
     ListStatesForTag(ctx context.Context, tag string) ([]State, error)
@@ -78,14 +84,14 @@ type StateEvent struct {
 
 // Manager is the main entrypoint for interacting with the state management system.
 // Each Manager instance is bound to a single task via taskIndex.
-type Manager struct {
-    // ... private fields
-    taskIndex int
+// Managers drive job lifecycle by invoking Store.NewJob or Store.OpenJob.
+
+func NewManagerForNewJob(ctx context.Context, store Store, jobID string, taskIndex int, numTasks int) (*Manager, error) {
+    // create job; fail if it already exists; returns a manager bound to the job-scoped store
 }
 
-// configured with the job's authoritative number of tasks and the caller's task index.
-func NewManager(jobID string, taskIndex int, numTasks int, store Store) *Manager {
-    // ... implementation
+func NewManagerForExistingJob(ctx context.Context, store Store, jobID string, taskIndex int) (*Manager, error) {
+    // open existing job; fail if missing; returns a manager bound to the job-scoped store
 }
 
 // Close gracefully shuts down the manager. It closes all active subscription
@@ -102,44 +108,8 @@ func (m *Manager) SetState(ctx context.Context, state State) error {
     // ... implementation
 }
 
-// SetError is a convenience method that sets a state with an error status and formatted message.
-// It automatically sets Status to a negative error code and formats the Message with "🔴 " prefix.
-// The provided state should have JobID, TaskID, Tag, and optionally Payload populated.
-// Example: manager.SetError(ctx, fmt.Errorf("connection timeout"), State{JobID: "job-1", TaskID: 0, Tag: "ingest"})
-func (m *Manager) SetError(ctx context.Context, err error, state State) error {
-    state.Status = -1  // or derive from error type/code if structured
-    state.Message = fmt.Sprintf("🔴 %v", err)
-    return m.SetState(ctx, state)
-}
-
-// SetStarted is a convenience method that marks a task/tag as started (Status = 1).
-// Example: manager.SetStarted(ctx, State{JobID: "job-1", TaskID: 0, Tag: "ingest", Message: "Beginning ingestion"})
-func (m *Manager) SetStarted(ctx context.Context, state State) error {
-    state.Status = 1
-    if state.Message == "" {
-        state.Message = "🟢 Started"
-    }
-    return m.SetState(ctx, state)
-}
-
-// SetFinished is a convenience method that marks a task/tag as finished (Status = math.MaxInt32).
-// Example: manager.SetFinished(ctx, State{JobID: "job-1", TaskID: 0, Tag: "ingest", Message: "Completed successfully"})
-func (m *Manager) SetFinished(ctx context.Context, state State) error {
-    state.Status = math.MaxInt32
-    if state.Message == "" {
-        state.Message = "⚫ Finished"
-    }
-    return m.SetState(ctx, state)
-}
-
-// SetWarning is a convenience method that sets a state with a warning status and formatted message.
-// It sets Status to -2 (warning code) and formats the Message with "🟡 " prefix.
-// Example: manager.SetWarning(ctx, "retrying connection", State{JobID: "job-1", TaskID: 0, Tag: "ingest"})
-func (m *Manager) SetWarning(ctx context.Context, warning string, state State) error {
-    state.Status = -2  // distinct warning code
-    state.Message = fmt.Sprintf("🟡 %s", warning)
-    return m.SetState(ctx, state)
-}
+// Convenience helpers such as SetError/SetStarted/SetFinished/SetWarning are intentionally omitted;
+// callers set Status/Message directly before invoking SetState.
 
 // Option defines the signature for functions that modify GetState queries.
 type Option func(*queryOptions)
@@ -267,21 +237,14 @@ The behavior of `Subscribe` changes based on the supplied `Option`s:
 
 The `firestoreStore` will implement the `Store` interface. A `firestoreStore` instance is scoped to a single job.
 
-### Constructor
+### Constructor and lifecycle
 
-The constructor will be a standalone function that handles the "get-or-create" logic for the job.
+`NewFirestoreStore(projectID string) Store` returns an unbound backend. It does not create or open any job.
 
-`func NewFirestoreStore(ctx context.Context, projectID, jobID string, numTasks int) (Store, int, error)`
+Job binding is explicit:
 
-**Logic:**
-1.  Initialize a new Firestore client using the `projectID`.
-2.  Reference the job document path: `jobs/{jobID}`.
-3.  In a Firestore transaction, attempt to read the document.
-    *   If the document exists, read the `numTasks` field from it. This value becomes the authoritative `numTasks`.
-    *   If the document does not exist, create it, setting the `numTasks` field with the value passed into the constructor.
-4.  Return a new `firestoreStore` instance containing the client, `jobID`, and the authoritative `numTasks`. The constructor also returns this authoritative `numTasks` value to the caller.
-
-The `firestoreStore` struct will hold the firestore client, the `jobID`, and the authoritative `numTasks`.
+* `NewJob(ctx, jobID, numTasks) (Store, int, error)` — creates `jobs/{jobID}` with `numTasks`; fails if it already exists or `numTasks <= 0`; returns a job-scoped store and the authoritative `numTasks`.
+* `OpenJob(ctx, jobID) (Store, int, error)` — opens an existing job; fails if missing or if `numTasks` is invalid; returns a job-scoped store and the authoritative `numTasks`.
 
 ### Data Model (current implementation)
 
@@ -294,7 +257,7 @@ The Firestore data model consists of a job document and a collection of state do
     * `numTasks` (number, authoritative count persisted at creation)
     * `deleted` (bool tombstone)
     * `schemaVersion` (number, added by migrations when bumping schema)
-* **Behavior:** Constructor performs get-or-create; preserves existing `numTasks` if present.
+* **Behavior:** `NewJob` creates and seeds `numTasks`; `OpenJob` reads it and fails if missing or invalid. No implicit creation during open.
 
 #### State Documents
 
@@ -362,6 +325,7 @@ Logging/metrics remain future work; current code does not emit structured logs o
 
 - Add utility functions to delete or tombstone a job (`DeleteJob` or `MarkJobDeleted`), removing the job document and associated task states or marking them for GC.
 - Define retention policy (e.g., delete jobs after configurable TTL once finished) and require appropriate IAM for cleanup operations.
+- A Firestore-only GC CLI (`cmd/gc`, build-tagged) tombstones jobs after a configurable age, then deletes them after a later age; `delete-age` must exceed `tombstone-age`.
 - Dashboard/monitoring consumers can subscribe in a "monitor" mode (subscribe to all tags/tasks) to display job lifecycle and status changes.
 
 ## 6. Testing Strategy
@@ -380,5 +344,5 @@ Logging/metrics remain future work; current code does not emit structured logs o
 
 ## 7. Current status and gaps
 
-* Implemented: Manager aggregation, replay+live subscribe with dedup; in-memory store; Firestore store (build tag); helper scripts and Make targets; migration stub.
-* Not yet implemented: structured logging/metrics; Firestore emulator tests; advanced schema migrations beyond stamping `schemaVersion` on job docs.
+* Implemented: Manager aggregation, replay+live subscribe with dedup; explicit Store lifecycle (NewJob/OpenJob); in-memory store; Firestore store; Firestore emulator integration test; helper scripts and Make targets; migration stub.
+* Not yet implemented: structured logging/metrics; advanced schema migrations beyond stamping `schemaVersion` on job docs.

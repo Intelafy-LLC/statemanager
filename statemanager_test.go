@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-type storeFactory func(t *testing.T, jobID string, numTasks int) Store
+type storeFactory func(t *testing.T) Store
 
 var defaultStores = []struct {
 	name string
@@ -15,19 +15,23 @@ var defaultStores = []struct {
 }{
 	{
 		name: "inmemory",
-		make: func(t *testing.T, jobID string, numTasks int) Store {
+		make: func(t *testing.T) Store {
 			t.Helper()
-			storeIface, _, err := NewInMemoryStore(context.Background(), jobID, numTasks)
-			if err != nil {
-				t.Fatalf("failed to create store: %v", err)
-			}
-			return storeIface
+			return NewInMemoryStore()
 		},
 	},
 }
 
 type stubStore struct {
 	closed bool
+}
+
+func (s *stubStore) NewJob(ctx context.Context, jobID string, numTasks int) (Store, int, error) {
+	return s, numTasks, nil
+}
+
+func (s *stubStore) OpenJob(ctx context.Context, jobID string) (Store, int, error) {
+	return s, 1, nil
 }
 
 func (s *stubStore) SetState(ctx context.Context, state State) error { return nil }
@@ -47,9 +51,12 @@ func (s *stubStore) Close() error { s.closed = true; return nil }
 
 func newTestManager(t *testing.T, factory storeFactory, jobID string, taskIndex int, numTasks int) (*Manager, Store) {
 	t.Helper()
-	store := factory(t, jobID, numTasks)
-	mgr := NewManager(jobID, taskIndex, numTasks, store)
-	return mgr, store
+	backend := factory(t)
+	mgr, err := NewManagerForNewJob(context.Background(), backend, jobID, taskIndex, numTasks)
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+	return mgr, mgr.store
 }
 
 func TestSetStateRejectsOtherTask(t *testing.T) {
@@ -68,10 +75,16 @@ func TestGetStateAggregations(t *testing.T) {
 	for _, f := range defaultStores {
 		t.Run(f.name, func(t *testing.T) {
 			numTasks := 3
-			store := f.make(t, "job-agg", numTasks)
+			backend := f.make(t)
 
-			mgr0 := NewManager("job-agg", 0, numTasks, store)
-			mgr1 := NewManager("job-agg", 1, numTasks, store)
+			mgr0, err := NewManagerForNewJob(context.Background(), backend, "job-agg", 0, numTasks)
+			if err != nil {
+				t.Fatalf("manager0 create: %v", err)
+			}
+			mgr1, err := NewManagerForExistingJob(context.Background(), backend, "job-agg", 1)
+			if err != nil {
+				t.Fatalf("manager1 open: %v", err)
+			}
 
 			// Write states for tag "ingest".
 			if err := mgr0.SetState(context.Background(), State{JobID: "job-agg", TaskID: 0, Tag: "ingest", Status: 1}); err != nil {
@@ -133,10 +146,16 @@ func TestSubscribeReplayAndLive(t *testing.T) {
 	for _, f := range defaultStores {
 		t.Run(f.name, func(t *testing.T) {
 			numTasks := 2
-			store := f.make(t, "job-sub", numTasks)
+			backend := f.make(t)
 
-			mgr0 := NewManager("job-sub", 0, numTasks, store)
-			mgr1 := NewManager("job-sub", 1, numTasks, store)
+			mgr0, err := NewManagerForNewJob(context.Background(), backend, "job-sub", 0, numTasks)
+			if err != nil {
+				t.Fatalf("manager0 create: %v", err)
+			}
+			mgr1, err := NewManagerForExistingJob(context.Background(), backend, "job-sub", 1)
+			if err != nil {
+				t.Fatalf("manager1 open: %v", err)
+			}
 
 			// Seed initial state so snapshot includes it.
 			if err := mgr0.SetState(context.Background(), State{JobID: "job-sub", TaskID: 0, Tag: "ingest", Status: 1}); err != nil {
@@ -180,8 +199,11 @@ func TestSubscribeVersionOrdering(t *testing.T) {
 	for _, f := range defaultStores {
 		t.Run(f.name, func(t *testing.T) {
 			numTasks := 1
-			store := f.make(t, "job-sub-version", numTasks)
-			mgr := NewManager("job-sub-version", 0, numTasks, store)
+			backend := f.make(t)
+			mgr, err := NewManagerForNewJob(context.Background(), backend, "job-sub-version", 0, numTasks)
+			if err != nil {
+				t.Fatalf("manager create: %v", err)
+			}
 
 			// Seed version 1
 			if err := mgr.SetState(context.Background(), State{JobID: "job-sub-version", TaskID: 0, Tag: "ingest", Status: 1}); err != nil {
@@ -213,8 +235,11 @@ func TestSubscribeVersionOrdering(t *testing.T) {
 func TestSubscribeContextCancelCloses(t *testing.T) {
 	for _, f := range defaultStores {
 		t.Run(f.name, func(t *testing.T) {
-			store := f.make(t, "job-sub-cancel", 1)
-			mgr := NewManager("job-sub-cancel", 0, 1, store)
+			backend := f.make(t)
+			mgr, err := NewManagerForNewJob(context.Background(), backend, "job-sub-cancel", 0, 1)
+			if err != nil {
+				t.Fatalf("manager create: %v", err)
+			}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			ch, err := mgr.Subscribe(ctx, WithTag("ingest"))
@@ -238,9 +263,15 @@ func TestSubscribeContextCancelCloses(t *testing.T) {
 func TestReplayOrdering(t *testing.T) {
 	for _, f := range defaultStores {
 		t.Run(f.name, func(t *testing.T) {
-			store := f.make(t, "job-replay-order", 2)
-			mgr0 := NewManager("job-replay-order", 0, 2, store)
-			mgr1 := NewManager("job-replay-order", 1, 2, store)
+			backend := f.make(t)
+			mgr0, err := NewManagerForNewJob(context.Background(), backend, "job-replay-order", 0, 2)
+			if err != nil {
+				t.Fatalf("manager0 create: %v", err)
+			}
+			mgr1, err := NewManagerForExistingJob(context.Background(), backend, "job-replay-order", 1)
+			if err != nil {
+				t.Fatalf("manager1 open: %v", err)
+			}
 
 			t2 := time.Now().Add(2 * time.Second)
 			t1 := time.Now()
@@ -309,8 +340,11 @@ func TestDeleteJobClearsState(t *testing.T) {
 func TestSubscribeEmptyThenLive(t *testing.T) {
 	for _, f := range defaultStores {
 		t.Run(f.name, func(t *testing.T) {
-			store := f.make(t, "job-sub-empty", 1)
-			mgr := NewManager("job-sub-empty", 0, 1, store)
+			backend := f.make(t)
+			mgr, err := NewManagerForNewJob(context.Background(), backend, "job-sub-empty", 0, 1)
+			if err != nil {
+				t.Fatalf("manager create: %v", err)
+			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
@@ -340,14 +374,15 @@ func TestSubscribeEmptyThenLive(t *testing.T) {
 
 func TestSubscribeFiltersByTag(t *testing.T) {
 	numTasks := 2
-	storeIface, _, err := NewInMemoryStore(context.Background(), "job-sub-filter-tag", numTasks)
+	backend := NewInMemoryStore()
+	mgr0, err := NewManagerForNewJob(context.Background(), backend, "job-sub-filter-tag", 0, numTasks)
 	if err != nil {
-		t.Fatalf("store init failed: %v", err)
+		t.Fatalf("manager0 create failed: %v", err)
 	}
-	store := storeIface.(*inMemoryStore)
-
-	mgr0 := NewManager("job-sub-filter-tag", 0, numTasks, store)
-	mgr1 := NewManager("job-sub-filter-tag", 1, numTasks, store)
+	mgr1, err := NewManagerForExistingJob(context.Background(), backend, "job-sub-filter-tag", 1)
+	if err != nil {
+		t.Fatalf("manager1 open failed: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -386,14 +421,15 @@ func TestSubscribeFiltersByTag(t *testing.T) {
 
 func TestSubscribeFiltersByTask(t *testing.T) {
 	numTasks := 2
-	storeIface, _, err := NewInMemoryStore(context.Background(), "job-sub-filter-task", numTasks)
+	backend := NewInMemoryStore()
+	mgr0, err := NewManagerForNewJob(context.Background(), backend, "job-sub-filter-task", 0, numTasks)
 	if err != nil {
-		t.Fatalf("store init failed: %v", err)
+		t.Fatalf("manager0 create failed: %v", err)
 	}
-	store := storeIface.(*inMemoryStore)
-
-	mgr0 := NewManager("job-sub-filter-task", 0, numTasks, store)
-	mgr1 := NewManager("job-sub-filter-task", 1, numTasks, store)
+	mgr1, err := NewManagerForExistingJob(context.Background(), backend, "job-sub-filter-task", 1)
+	if err != nil {
+		t.Fatalf("manager1 open failed: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -430,14 +466,15 @@ func TestSubscribeFiltersByTask(t *testing.T) {
 
 func TestSubscribeAllEvents(t *testing.T) {
 	numTasks := 2
-	storeIface, _, err := NewInMemoryStore(context.Background(), "job-sub-all", numTasks)
+	backend := NewInMemoryStore()
+	mgr0, err := NewManagerForNewJob(context.Background(), backend, "job-sub-all", 0, numTasks)
 	if err != nil {
-		t.Fatalf("store init failed: %v", err)
+		t.Fatalf("manager0 create failed: %v", err)
 	}
-	store := storeIface.(*inMemoryStore)
-
-	mgr0 := NewManager("job-sub-all", 0, numTasks, store)
-	mgr1 := NewManager("job-sub-all", 1, numTasks, store)
+	mgr1, err := NewManagerForExistingJob(context.Background(), backend, "job-sub-all", 1)
+	if err != nil {
+		t.Fatalf("manager1 open failed: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -468,7 +505,10 @@ func TestSubscribeAllEvents(t *testing.T) {
 
 func TestManagerAccessorsAndClose(t *testing.T) {
 	s := &stubStore{}
-	mgr := NewManager("job-access", 2, 5, s)
+	mgr, err := NewManagerForNewJob(context.Background(), s, "job-access", 2, 5)
+	if err != nil {
+		t.Fatalf("manager create failed: %v", err)
+	}
 
 	if mgr.JobID() != "job-access" {
 		t.Fatalf("unexpected JobID: %s", mgr.JobID())
@@ -494,7 +534,10 @@ func TestManagerAccessorsAndClose(t *testing.T) {
 }
 
 func TestManagerCleanupUnsupported(t *testing.T) {
-	mgr := NewManager("job-cleanup", 0, 1, &stubStore{})
+	mgr, err := NewManagerForNewJob(context.Background(), &stubStore{}, "job-cleanup", 0, 1)
+	if err != nil {
+		t.Fatalf("manager create failed: %v", err)
+	}
 	if err := mgr.DeleteJob(context.Background()); !errors.Is(err, ErrNotSupported) {
 		t.Fatalf("expected ErrNotSupported, got %v", err)
 	}
@@ -504,12 +547,11 @@ func TestManagerCleanupUnsupported(t *testing.T) {
 }
 
 func TestMarkJobDeletedClearsState(t *testing.T) {
-	storeIface, _, err := NewInMemoryStore(context.Background(), "job-mark-delete", 1)
+	backend := NewInMemoryStore()
+	mgr, err := NewManagerForNewJob(context.Background(), backend, "job-mark-delete", 0, 1)
 	if err != nil {
-		t.Fatalf("store init failed: %v", err)
+		t.Fatalf("manager create failed: %v", err)
 	}
-	store := storeIface.(*inMemoryStore)
-	mgr := NewManager("job-mark-delete", 0, 1, store)
 
 	if err := mgr.SetState(context.Background(), State{JobID: "job-mark-delete", TaskID: 0, Tag: "ingest", Status: 1}); err != nil {
 		t.Fatalf("set failed: %v", err)
@@ -517,17 +559,22 @@ func TestMarkJobDeletedClearsState(t *testing.T) {
 	if err := mgr.MarkJobDeleted(context.Background()); err != nil {
 		t.Fatalf("MarkJobDeleted failed: %v", err)
 	}
-	if len(store.cache) != 0 {
-		t.Fatalf("expected cache to be cleared after mark delete")
+	states, err := mgr.store.ListAllStates(context.Background())
+	if err != nil {
+		t.Fatalf("ListAllStates after mark delete failed: %v", err)
+	}
+	if len(states) != 0 {
+		t.Fatalf("expected no states after mark delete, got %d", len(states))
 	}
 }
 
 func TestInMemoryStoreCloseClosesSubscribers(t *testing.T) {
-	storeIface, _, err := NewInMemoryStore(context.Background(), "job-store-close", 1)
+	backend := NewInMemoryStore()
+	jobStoreIface, _, err := backend.NewJob(context.Background(), "job-store-close", 1)
 	if err != nil {
-		t.Fatalf("store init failed: %v", err)
+		t.Fatalf("job create failed: %v", err)
 	}
-	store := storeIface.(*inMemoryStore)
+	store := jobStoreIface.(*inMemoryStore)
 
 	ch, err := store.Subscribe(context.Background())
 	if err != nil {
@@ -552,12 +599,15 @@ func TestInMemoryStoreCloseClosesSubscribers(t *testing.T) {
 }
 
 func TestSubscribeSpecificTaskAndTagSnapshot(t *testing.T) {
-	storeIface, _, err := NewInMemoryStore(context.Background(), "job-sub-specific", 2)
+	backend := NewInMemoryStore()
+	mgr0, err := NewManagerForNewJob(context.Background(), backend, "job-sub-specific", 0, 2)
 	if err != nil {
-		t.Fatalf("store init failed: %v", err)
+		t.Fatalf("manager0 create failed: %v", err)
 	}
-	mgr0 := NewManager("job-sub-specific", 0, 2, storeIface)
-	mgr1 := NewManager("job-sub-specific", 1, 2, storeIface)
+	mgr1, err := NewManagerForExistingJob(context.Background(), backend, "job-sub-specific", 1)
+	if err != nil {
+		t.Fatalf("manager1 open failed: %v", err)
+	}
 
 	if err := mgr0.SetState(context.Background(), State{JobID: "job-sub-specific", TaskID: 0, Tag: "ingest", Status: 1}); err != nil {
 		t.Fatalf("seed task0 failed: %v", err)
