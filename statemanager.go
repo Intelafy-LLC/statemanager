@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -30,18 +31,20 @@ type StateEvent struct {
 
 // Errors returned by the manager/store.
 var (
-	ErrTaskMismatch = errors.New("state task does not match manager task")
-	ErrNotSupported = errors.New("operation not supported by store")
-	ErrNotFound     = errors.New("state not found")
+	ErrTaskMismatch  = errors.New("state task does not match manager task")
+	ErrNotSupported  = errors.New("operation not supported by store")
+	ErrNotFound      = errors.New("state not found")
+	ErrAlreadyExists = errors.New("resource already exists")
 	// ErrNotImplemented is returned by stubbed methods.
 	ErrNotImplemented = errors.New("not implemented")
 )
 
 // Store abstracts backend access and job lifecycle.
 //
-// Unbound usage: call NewJob (create, fail if exists) or OpenJob (open, fail if missing)
-// to obtain a job-scoped Store. Job-scoped instances implement the same interface; calling
-// job operations on an unbound instance should return ErrNotSupported.
+// Typical usage: construct a backend Store, call NewJob (create) or OpenJob (open existing)
+// to obtain a job-scoped Store, register it via InsertStore, then create managers with
+// NewManager. Job-scoped instances implement the same interface; calling job operations on
+// a backend (unbound) instance may return ErrNotSupported.
 type Store interface {
 	// NewJob creates a job and returns a job-scoped Store plus the authoritative numTasks.
 	// It must fail if the job already exists or numTasks <= 0.
@@ -56,6 +59,97 @@ type Store interface {
 	ListAllStates(ctx context.Context) ([]State, error)
 	Subscribe(ctx context.Context) (<-chan StateEvent, error)
 	Close() error
+}
+
+// JobScopedStore is a Store bound to a specific job and exposes its metadata.
+type JobScopedStore interface {
+	Store
+	JobID() string
+	NumTasks() int
+}
+
+type storeRegistry struct {
+	mu     sync.RWMutex
+	stores map[string]JobScopedStore
+}
+
+func newStoreRegistry() *storeRegistry {
+	return &storeRegistry{stores: make(map[string]JobScopedStore)}
+}
+
+func (r *storeRegistry) insert(ctx context.Context, store JobScopedStore) (bool, error) {
+	if store == nil {
+		return false, ErrNotSupported
+	}
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	default:
+	}
+	jobID := store.JobID()
+	if jobID == "" {
+		return false, ErrNotSupported
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if existing, ok := r.stores[jobID]; ok {
+		if existing == store {
+			return false, nil
+		}
+		return false, ErrAlreadyExists
+	}
+
+	r.stores[jobID] = store
+	return true, nil
+}
+
+func (r *storeRegistry) get(jobID string) (JobScopedStore, bool) {
+	r.mu.RLock()
+	store, ok := r.stores[jobID]
+	r.mu.RUnlock()
+	return store, ok
+}
+
+func (r *storeRegistry) remove(jobID string) {
+	r.mu.Lock()
+	delete(r.stores, jobID)
+	r.mu.Unlock()
+}
+
+func (r *storeRegistry) closeAll() {
+	r.mu.Lock()
+	stores := r.stores
+	r.stores = make(map[string]JobScopedStore)
+	r.mu.Unlock()
+
+	for _, s := range stores {
+		_ = s.Close()
+	}
+}
+
+var defaultStoreRegistry = newStoreRegistry()
+
+// InsertStore registers a job-scoped store for shared use keyed by its jobID.
+// It returns true if the store was newly inserted, false if the same store was already present.
+func InsertStore(ctx context.Context, store JobScopedStore) (bool, error) {
+	return defaultStoreRegistry.insert(ctx, store)
+}
+
+// GetStore retrieves a registered job-scoped store by jobID.
+func GetStore(jobID string) (JobScopedStore, bool) {
+	return defaultStoreRegistry.get(jobID)
+}
+
+// RemoveStore deletes the mapping for jobID without closing the store.
+func RemoveStore(jobID string) {
+	defaultStoreRegistry.remove(jobID)
+}
+
+// CloseAllStores closes all registered stores and clears the registry.
+func CloseAllStores() {
+	defaultStoreRegistry.closeAll()
 }
 
 // Cleaner defines optional cleanup capabilities for a store implementation.
@@ -88,31 +182,22 @@ func (m *Manager) NumTasks() int {
 	return m.numTasks
 }
 
-// NewManagerForNewJob creates the job (failing if it already exists) and binds a manager to it.
-func NewManagerForNewJob(ctx context.Context, store Store, jobID string, taskIndex int, numTasks int) (*Manager, error) {
-	jobStore, resolved, err := store.NewJob(ctx, jobID, numTasks)
-	if err != nil {
-		return nil, err
+// NewManager returns a manager backed by a registered job-scoped store.
+// If taskIndex is omitted, the manager is unbound to any task and SetState will fail.
+func NewManager(jobID string, taskIndex ...int) (*Manager, error) {
+	store, ok := GetStore(jobID)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	idx := -1
+	if len(taskIndex) > 0 {
+		idx = taskIndex[0]
 	}
 	return &Manager{
 		jobID:     jobID,
-		taskIndex: taskIndex,
-		numTasks:  resolved,
-		store:     jobStore,
-	}, nil
-}
-
-// NewManagerForExistingJob opens an existing job (failing if missing) and binds a manager to it.
-func NewManagerForExistingJob(ctx context.Context, store Store, jobID string, taskIndex int) (*Manager, error) {
-	jobStore, resolved, err := store.OpenJob(ctx, jobID)
-	if err != nil {
-		return nil, err
-	}
-	return &Manager{
-		jobID:     jobID,
-		taskIndex: taskIndex,
-		numTasks:  resolved,
-		store:     jobStore,
+		taskIndex: idx,
+		numTasks:  store.NumTasks(),
+		store:     store,
 	}, nil
 }
 
@@ -144,7 +229,7 @@ func (m *Manager) MarkJobDeleted(ctx context.Context) error {
 // SetState persists the state for a specific task and tag.
 // It rejects writes where state.TaskID does not match the manager's taskIndex.
 func (m *Manager) SetState(ctx context.Context, state State) error {
-	if state.TaskID != m.taskIndex {
+	if m.taskIndex < 0 || state.TaskID != m.taskIndex {
 		return ErrTaskMismatch
 	}
 	return m.store.SetState(ctx, state)
@@ -251,7 +336,7 @@ func (m *Manager) GetState(ctx context.Context, opts ...Option) (State, error) {
 	return minState, nil
 }
 
-// Subscribe returns a channel that emits state changes.
+// Subscribe returns a channel that emits state changes, with replay provided by the store.
 // The lifetime of the subscription is tied to the provided context.
 func (m *Manager) Subscribe(ctx context.Context, opts ...Option) (<-chan StateEvent, error) {
 	qo := &queryOptions{}
@@ -259,9 +344,9 @@ func (m *Manager) Subscribe(ctx context.Context, opts ...Option) (<-chan StateEv
 		opt(qo)
 	}
 
-	// Prepare replay snapshot based on options.
-	snapshot, err := m.snapshotStates(ctx, qo)
-	if err != nil {
+	// Build replay snapshot before subscribing to avoid missing live events between snapshot and live stream.
+	replay, err := m.snapshotStates(ctx, qo)
+	if err != nil && !errors.Is(err, ErrNotFound) {
 		return nil, err
 	}
 
@@ -273,23 +358,20 @@ func (m *Manager) Subscribe(ctx context.Context, opts ...Option) (<-chan StateEv
 	out := make(chan StateEvent, 4)
 	seen := make(map[string]int64)
 
-	// Emit replay in timestamp ascending order, deduplicated by increasing version per key.
 	go func() {
 		defer close(out)
-		for _, st := range snapshot {
+
+		for _, st := range replay {
 			key := stateKey(st)
-			if v, ok := seen[key]; ok && st.Version <= v {
-				continue
+			if v, ok := seen[key]; !ok || st.Version > v {
+				seen[key] = st.Version
 			}
-			seen[key] = st.Version
 			select {
 			case out <- StateEvent{State: st, Replay: true}:
 			case <-ctx.Done():
 				return
 			}
 		}
-
-		// Live phase: forward filtered updates, deduping by version.
 		for {
 			select {
 			case <-ctx.Done():
@@ -307,7 +389,7 @@ func (m *Manager) Subscribe(ctx context.Context, opts ...Option) (<-chan StateEv
 				}
 				seen[key] = evt.State.Version
 				select {
-				case out <- StateEvent{State: evt.State, Replay: false}:
+				case out <- evt:
 				case <-ctx.Done():
 					return
 				}

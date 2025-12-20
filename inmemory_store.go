@@ -35,6 +35,7 @@ var (
 )
 
 // NewInMemoryStore constructs an unbound in-memory store backend.
+// Call NewJob to create a job-scoped store.
 func NewInMemoryStore() Store {
 	root := &inMemoryStore{}
 	root.root = root
@@ -61,7 +62,8 @@ func (s *inMemoryStore) NewJob(ctx context.Context, jobID string, numTasks int) 
 		subscribers: make(map[chan StateEvent]struct{}),
 	}
 	root.jobs[jobID] = job
-	return &inMemoryStore{root: root, job: job, jobID: jobID}, numTasks, nil
+	jobStore := &inMemoryStore{root: root, job: job, jobID: jobID}
+	return jobStore, numTasks, nil
 }
 
 // OpenJob opens an existing job.
@@ -74,7 +76,8 @@ func (s *inMemoryStore) OpenJob(ctx context.Context, jobID string) (Store, int, 
 	if !ok {
 		return nil, 0, ErrNotFound
 	}
-	return &inMemoryStore{root: root, job: job, jobID: jobID}, job.numTasks, nil
+	jobStore := &inMemoryStore{root: root, job: job, jobID: jobID}
+	return jobStore, job.numTasks, nil
 }
 
 // SetState writes a state, bumping version per {tag,task} key.
@@ -180,7 +183,7 @@ func (s *inMemoryStore) ListAllStates(ctx context.Context) ([]State, error) {
 	return out, nil
 }
 
-// Subscribe registers a new subscriber and returns its channel.
+// Subscribe registers a new subscriber and streams live updates.
 func (s *inMemoryStore) Subscribe(ctx context.Context) (<-chan StateEvent, error) {
 	job := s.job
 	if job == nil {
@@ -203,13 +206,24 @@ func (s *inMemoryStore) Subscribe(ctx context.Context) (<-chan StateEvent, error
 
 	go func() {
 		<-ctx.Done()
-		job.mu.Lock()
-		delete(job.subscribers, ch)
-		close(ch)
-		job.mu.Unlock()
+		if removed := cleanupSubscriber(job, ch); removed {
+			close(ch)
+		}
 	}()
 
 	return ch, nil
+}
+
+// cleanupSubscriber removes a subscriber and reports whether it was still registered.
+// The caller decides whether to close the channel to avoid double-closing races with Close().
+func cleanupSubscriber(job *inMemoryJob, ch chan StateEvent) bool {
+	job.mu.Lock()
+	_, ok := job.subscribers[ch]
+	if ok {
+		delete(job.subscribers, ch)
+	}
+	job.mu.Unlock()
+	return ok
 }
 
 // Close stops the store and closes internal channels.
@@ -260,6 +274,19 @@ func (s *inMemoryStore) rootStore() *inMemoryStore {
 		return s.root
 	}
 	return s
+}
+
+// JobID returns the bound job identifier, or empty string if unbound.
+func (s *inMemoryStore) JobID() string {
+	return s.jobID
+}
+
+// NumTasks returns the configured number of tasks for the bound job.
+func (s *inMemoryStore) NumTasks() int {
+	if s.job != nil {
+		return s.job.numTasks
+	}
+	return 0
 }
 
 func copySubscribers(src map[chan StateEvent]struct{}) map[chan StateEvent]struct{} {

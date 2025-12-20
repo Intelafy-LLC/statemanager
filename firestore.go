@@ -28,8 +28,10 @@ type firestoreStore struct {
 	numTasks int
 	bound    bool
 
-	mu          sync.Mutex
+	mu           sync.Mutex
 	subscribers map[chan StateEvent]context.CancelFunc
+	cache       map[string]State
+	cacheReady  bool
 	closed      bool
 }
 
@@ -85,6 +87,7 @@ func (f *firestoreStore) NewJob(ctx context.Context, jobID string, numTasks int)
 		numTasks:         numTasks,
 		bound:            true,
 		subscribers:      make(map[chan StateEvent]context.CancelFunc),
+		cache:            make(map[string]State),
 	}
 
 	return fs, numTasks, nil
@@ -149,7 +152,7 @@ func (f *firestoreStore) SetState(ctx context.Context, state State) error {
 	key := stateKey(state)
 	state.JobID = f.jobID
 
-	return f.client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+	err := f.client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
 		doc := f.states.Doc(key)
 		prevVer := int64(0)
 		snap, err := tx.Get(doc)
@@ -169,6 +172,7 @@ func (f *firestoreStore) SetState(ctx context.Context, state State) error {
 		}
 		return tx.Set(doc, state)
 	})
+	return err
 }
 
 // GetState reads a single state.
@@ -288,6 +292,7 @@ func (f *firestoreStore) Subscribe(ctx context.Context) (<-chan StateEvent, erro
 		for {
 			snap, err := it.Next()
 			if err != nil {
+				f.removeSubscriber(ch)
 				return
 			}
 			for _, change := range snap.Changes {
@@ -300,6 +305,7 @@ func (f *firestoreStore) Subscribe(ctx context.Context) (<-chan StateEvent, erro
 				}
 				select {
 				case <-ctxSub.Done():
+					f.removeSubscriber(ch)
 					return
 				case ch <- StateEvent{State: st, Replay: false}:
 				}
@@ -327,6 +333,22 @@ func (f *firestoreStore) Close() error {
 	f.subscribers = nil
 	f.mu.Unlock()
 	return f.client.Close()
+}
+
+func (f *firestoreStore) removeSubscriber(ch chan StateEvent) {
+	f.mu.Lock()
+	delete(f.subscribers, ch)
+	f.mu.Unlock()
+}
+
+// JobID returns the bound job identifier, or empty string if unbound.
+func (f *firestoreStore) JobID() string {
+	return f.jobID
+}
+
+// NumTasks returns the configured number of tasks for the bound job.
+func (f *firestoreStore) NumTasks() int {
+	return f.numTasks
 }
 
 // DeleteJob removes job metadata and task states.

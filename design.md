@@ -145,6 +145,12 @@ func (m *Manager) Synchronize(ctx context.Context, tag string, targetStatus int3
     // ... implementation
 }
 
+// ManagerRegistry caches Managers per jobID for reuse across goroutines.
+// It provides GetOrCreate(ctx, jobID, factory) and CloseAll().
+type ManagerRegistry struct {
+    // ... fields
+}
+
 // Subscribe returns a channel that emits state change events.
 // The lifetime of the subscription is tied to the provided context.
 // To unsubscribe, the client must cancel the context. This will signal the

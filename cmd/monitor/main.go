@@ -31,9 +31,19 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{AddSource: false}))
 
 	backend := statemanager.NewFirestoreStore(*projectID)
-	mgr, err := statemanager.NewManagerForExistingJob(ctx, backend, *jobID, 0)
+	jobStoreIface, _, err := backend.OpenJob(ctx, *jobID)
 	if err != nil {
-		logger.Error("open_manager", slog.String("jobID", *jobID), slog.Any("err", err))
+		logger.Error("open_job", slog.String("jobID", *jobID), slog.Any("err", err))
+		os.Exit(1)
+	}
+	jobStore := jobStoreIface.(statemanager.JobScopedStore)
+	if inserted, err := statemanager.InsertStore(ctx, jobStore); err != nil || !inserted {
+		logger.Error("insert_store", slog.String("jobID", *jobID), slog.Any("err", err), slog.Bool("inserted", inserted))
+		os.Exit(1)
+	}
+	mgr, err := statemanager.NewManager(*jobID)
+	if err != nil {
+		logger.Error("new_manager", slog.String("jobID", *jobID), slog.Any("err", err))
 		os.Exit(1)
 	}
 	defer mgr.Close()
