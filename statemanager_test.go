@@ -438,6 +438,48 @@ func TestSubscribeReplayAndLive(t *testing.T) {
 	}
 }
 
+func TestRunTokenUsesPhysicalID(t *testing.T) {
+	CloseAllStores()
+	backend := NewInMemoryStore()
+
+	ctxRun := WithRunToken(context.Background(), "run-physical-1")
+	jobStore, _, err := backend.NewJob(ctxRun, "logical-job", 1)
+	if err != nil {
+		t.Fatalf("NewJob: %v", err)
+	}
+	js := jobStore.(JobScopedStore)
+	if inserted, err := InsertStore(ctxRun, js); err != nil || !inserted {
+		t.Fatalf("InsertStore: %v inserted=%v", err, inserted)
+	}
+
+	mgr, err := NewManager("logical-job", 0)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := mgr.SetState(context.Background(), State{JobID: "logical-job", TaskID: 0, Tag: "ingest", Status: 1}); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+
+	// Open using the physical run token succeeds.
+	ctxOpen := WithRunToken(context.Background(), "run-physical-1")
+	openedStore, _, err := backend.OpenJob(ctxOpen, "logical-job")
+	if err != nil {
+		t.Fatalf("OpenJob with run token: %v", err)
+	}
+	st, err := openedStore.GetState(context.Background(), 0, "ingest")
+	if err != nil {
+		t.Fatalf("GetState via run token: %v", err)
+	}
+	if st.Status != 1 {
+		t.Fatalf("unexpected status: %d", st.Status)
+	}
+
+	// Open without the run token should fail because the physical key differs.
+	if _, _, err := backend.OpenJob(context.Background(), "logical-job"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound without run token, got %v", err)
+	}
+}
+
 func TestSubscribeVersionOrdering(t *testing.T) {
 	for _, f := range defaultStores {
 		t.Run(f.name, func(t *testing.T) {
@@ -776,8 +818,8 @@ func TestManagerAccessorsAndClose(t *testing.T) {
 	if err := mgr.Close(); err != nil {
 		t.Fatalf("close failed: %v", err)
 	}
-	if !s.closed {
-		t.Fatalf("expected stub store to be closed")
+	if s.closed {
+		t.Fatalf("manager should not close underlying store")
 	}
 
 	var nilMgr *Manager

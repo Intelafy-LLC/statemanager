@@ -10,9 +10,10 @@ import (
 // inMemoryStore is an in-memory implementation of Store.
 // A root instance manages jobs; job-scoped instances operate on a single job.
 type inMemoryStore struct {
-	root  *inMemoryStore
-	job   *inMemoryJob
-	jobID string
+	root     *inMemoryStore
+	job      *inMemoryJob
+	jobID    string
+	physical string
 
 	mu   sync.Mutex // protects jobs map (root only)
 	jobs map[string]*inMemoryJob
@@ -45,14 +46,17 @@ func NewInMemoryStore() Store {
 
 // NewJob creates a job and returns a job-scoped store.
 func (s *inMemoryStore) NewJob(ctx context.Context, jobID string, numTasks int) (Store, int, error) {
-	_ = ctx
 	if numTasks <= 0 {
 		return nil, 0, ErrNotSupported
+	}
+	physicalID := runTokenFromContext(ctx)
+	if physicalID == "" {
+		physicalID = jobID
 	}
 	root := s.rootStore()
 	root.mu.Lock()
 	defer root.mu.Unlock()
-	if _, exists := root.jobs[jobID]; exists {
+	if _, exists := root.jobs[physicalID]; exists {
 		return nil, 0, ErrNotSupported
 	}
 	job := &inMemoryJob{
@@ -61,22 +65,25 @@ func (s *inMemoryStore) NewJob(ctx context.Context, jobID string, numTasks int) 
 		versions:    make(map[string]int64),
 		subscribers: make(map[chan StateEvent]struct{}),
 	}
-	root.jobs[jobID] = job
-	jobStore := &inMemoryStore{root: root, job: job, jobID: jobID}
+	root.jobs[physicalID] = job
+	jobStore := &inMemoryStore{root: root, job: job, jobID: jobID, physical: physicalID}
 	return jobStore, numTasks, nil
 }
 
 // OpenJob opens an existing job.
 func (s *inMemoryStore) OpenJob(ctx context.Context, jobID string) (Store, int, error) {
-	_ = ctx
+	physicalID := runTokenFromContext(ctx)
+	if physicalID == "" {
+		physicalID = jobID
+	}
 	root := s.rootStore()
 	root.mu.Lock()
 	defer root.mu.Unlock()
-	job, ok := root.jobs[jobID]
+	job, ok := root.jobs[physicalID]
 	if !ok {
 		return nil, 0, ErrNotFound
 	}
-	jobStore := &inMemoryStore{root: root, job: job, jobID: jobID}
+	jobStore := &inMemoryStore{root: root, job: job, jobID: jobID, physical: physicalID}
 	return jobStore, job.numTasks, nil
 }
 

@@ -28,7 +28,7 @@ type firestoreStore struct {
 	numTasks int
 	bound    bool
 
-	mu           sync.Mutex
+	mu          sync.Mutex
 	subscribers map[chan StateEvent]context.CancelFunc
 	cache       map[string]State
 	cacheReady  bool
@@ -48,33 +48,41 @@ func (f *firestoreStore) NewJob(ctx context.Context, jobID string, numTasks int)
 	if numTasks <= 0 {
 		return nil, 0, ErrNotSupported
 	}
+	physicalID := runTokenFromContext(ctx)
+	if physicalID == "" {
+		physicalID = jobID
+	}
 	client, err := firestore.NewClient(ctx, f.projectID)
 	if err != nil {
 		return nil, 0, fmt.Errorf("new firestore client: %w", err)
 	}
 
-	jobDoc := client.Collection(f.collectionPrefix).Doc(jobID)
+	jobDoc := client.Collection(f.collectionPrefix).Doc(physicalID)
 	states := jobDoc.Collection("states")
 
-	err = client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
-		snap, err := tx.Get(jobDoc)
-		if err != nil {
-			if status.Code(err) != codes.NotFound {
-				return err
+	if _, err := jobDoc.Create(ctx, map[string]any{"numTasks": numTasks, "deleted": false}); err != nil {
+		if status.Code(err) == codes.AlreadyExists {
+			snap, getErr := jobDoc.Get(ctx)
+			if getErr != nil {
+				_ = client.Close()
+				return nil, 0, fmt.Errorf("open existing job doc: %w", getErr)
 			}
-			return tx.Set(jobDoc, map[string]any{
-				"numTasks": numTasks,
-				"deleted":  false,
-			})
+			var job struct {
+				NumTasks int `firestore:"numTasks"`
+			}
+			if dataErr := snap.DataTo(&job); dataErr != nil {
+				_ = client.Close()
+				return nil, 0, fmt.Errorf("parse existing job doc: %w", dataErr)
+			}
+			if job.NumTasks != numTasks {
+				_ = client.Close()
+				return nil, 0, fmt.Errorf("job %s exists with numTasks %d (wanted %d)", jobID, job.NumTasks, numTasks)
+			}
+			numTasks = job.NumTasks
+		} else {
+			_ = client.Close()
+			return nil, 0, fmt.Errorf("init job doc: %w", err)
 		}
-		if snap.Exists() {
-			return ErrNotSupported
-		}
-		return nil
-	})
-	if err != nil {
-		_ = client.Close()
-		return nil, 0, fmt.Errorf("init job doc: %w", err)
 	}
 
 	fs := &firestoreStore{
@@ -95,12 +103,16 @@ func (f *firestoreStore) NewJob(ctx context.Context, jobID string, numTasks int)
 
 // OpenJob opens an existing Firestore job and returns a job-scoped store.
 func (f *firestoreStore) OpenJob(ctx context.Context, jobID string) (Store, int, error) {
+	physicalID := runTokenFromContext(ctx)
+	if physicalID == "" {
+		physicalID = jobID
+	}
 	client, err := firestore.NewClient(ctx, f.projectID)
 	if err != nil {
 		return nil, 0, fmt.Errorf("new firestore client: %w", err)
 	}
 
-	jobDoc := client.Collection(f.collectionPrefix).Doc(jobID)
+	jobDoc := client.Collection(f.collectionPrefix).Doc(physicalID)
 	states := jobDoc.Collection("states")
 
 	snap, err := jobDoc.Get(ctx)

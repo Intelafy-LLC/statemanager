@@ -217,7 +217,7 @@ The `Subscribe` method provides a two-phase "replay then live" model:
 
 1.  **Replay Phase (ordered snapshot)**: Upon subscription, the manager delivers a snapshot of the current job state that matches the subscription options. Snapshot events are sent as individual `State` objects **in ascending timestamp order (oldest to newest)** so that action replays preserve causality. Snapshots include only states that actually exist; no synthesized `status: 0` entries are emitted. Snapshot events are marked so clients can distinguish replayed history from live updates.
 
-2.  **Live Phase**: After replay completes, the manager streams subsequent state changes that match the subscription options. Live updates do not reorder; they arrive as the store emits them. A sentinel message (or a documented replay-complete signal) marks the transition so clients avoid double-processing.
+2.  **Live Phase**: After replay completes, the manager streams subsequent state changes that match the subscription options. Live updates do not reorder; they arrive as the store emits them. Replay completion is implicit once the initial snapshot events have been sent (no sentinel today).
 
 Channel semantics: channels are closed when the subscription context is cancelled; any buffered messages that the client abandons are dropped. Channels should be small but at least depth 4 to provide modest burst tolerance without hiding backpressure.
 
@@ -259,6 +259,7 @@ Job binding is explicit:
 
 * `NewJob(ctx, jobID, numTasks) (Store, int, error)` — creates `jobs/{jobID}` with `numTasks`; fails if it already exists or `numTasks <= 0`; returns a job-scoped store and the authoritative `numTasks`.
 * `OpenJob(ctx, jobID) (Store, int, error)` — opens an existing job; fails if missing or if `numTasks` is invalid; returns a job-scoped store and the authoritative `numTasks`.
+* `WithRunToken(ctx, token)` (optional) — when provided, stores use `token` as the physical storage key, while the logical job identity remains `jobID`. This lets reruns share storage under a stable token without changing client-facing job IDs.
 
 ### Data Model (current implementation)
 
@@ -285,7 +286,7 @@ The Firestore data model consists of a job document and a collection of state do
 ### Subscriptions (current behavior)
 
 * Each store instance establishes a Firestore snapshot stream on `states` and fans changes to subscribers.
-* The manager performs the replay+live pipeline, filtering and deduping by `{tag, taskID, version}`. No in-process cache is kept today; reads hit Firestore directly.
+* The manager builds a replay snapshot first (using `ListStates*`) to avoid gaps, then switches to live events from the store, filtering and deduping by `{tag, taskID, version}`. No in-process cache is kept today; reads hit Firestore directly.
 
 ### `Subscribe` Implementation
 
@@ -355,8 +356,9 @@ Logging/metrics remain future work; current code does not emit structured logs o
 - Use Firestore emulator for CI to avoid cloud dependencies.
 - Include `-race` detector runs for cache/subscription concurrency.
 - Mock `Store` for unit testing `Manager` aggregation logic.
+- Integration tests exercise Firestore create/open, set/get, subscribe, and `ListAllStates` against the emulator (`FIRESTORE_EMULATOR_HOST`, `FIRESTORE_PROJECT_ID`).
 
 ## 7. Current status and gaps
 
-* Implemented: Manager aggregation, replay+live subscribe with dedup; explicit Store lifecycle (NewJob/OpenJob); in-memory store; Firestore store; Firestore emulator integration test; helper scripts and Make targets; migration stub.
-* Not yet implemented: structured logging/metrics; advanced schema migrations beyond stamping `schemaVersion` on job docs.
+* Implemented: Manager aggregation; replay+live subscribe with version dedup; explicit Store lifecycle (NewJob/OpenJob); in-memory store; Firestore store; Firestore emulator integration tests covering create/open/set/get/subscribe/ListAllStates; helper scripts and Make targets; migration stub; in-memory subscriber cleanup made idempotent to avoid double-close panics.
+* Not yet implemented: structured logging/metrics; advanced schema migrations beyond stamping `schemaVersion`; Firestore DeleteJob/MarkJobDeleted remain untested and deferred.

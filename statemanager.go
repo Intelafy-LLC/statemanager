@@ -29,6 +29,23 @@ type StateEvent struct {
 	Replay bool
 }
 
+// WithRunToken annotates a context with a physical run token used by stores to
+// choose the underlying storage key. When empty, stores fall back to the logical
+// jobID. Managers and callers still identify the job by the logical jobID.
+func WithRunToken(ctx context.Context, runToken string) context.Context {
+	return context.WithValue(ctx, runTokenKey{}, runToken)
+}
+
+// runTokenFromContext extracts the run token if present.
+func runTokenFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(runTokenKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+type runTokenKey struct{}
+
 // Errors returned by the manager/store.
 var (
 	ErrTaskMismatch  = errors.New("state task does not match manager task")
@@ -165,6 +182,8 @@ type Manager struct {
 	taskIndex int
 	numTasks  int
 	store     Store
+	subsMu    sync.Mutex
+	subs      []context.CancelFunc
 }
 
 // JobID returns the job identifier for this manager.
@@ -201,13 +220,22 @@ func NewManager(jobID string, taskIndex ...int) (*Manager, error) {
 	}, nil
 }
 
-// Close gracefully shuts down the manager. It closes all active subscription
-// channels and closes the underlying store connection.
+// Close gracefully shuts down the manager. It cancels all subscriptions created
+// via this manager but does not close the underlying store (callers own store lifecycle).
 func (m *Manager) Close() error {
 	if m == nil || m.store == nil {
 		return nil
 	}
-	return m.store.Close()
+	m.subsMu.Lock()
+	cancels := m.subs
+	m.subs = nil
+	m.subsMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+    m.subs = m.subs[:0]
+	return nil
 }
 
 // DeleteJob deletes all job metadata and task states if the underlying store supports it.
@@ -344,13 +372,18 @@ func (m *Manager) Subscribe(ctx context.Context, opts ...Option) (<-chan StateEv
 		opt(qo)
 	}
 
+	ctxSub, cancel := context.WithCancel(ctx)
+	m.subsMu.Lock()
+	m.subs = append(m.subs, cancel)
+	m.subsMu.Unlock()
+
 	// Build replay snapshot before subscribing to avoid missing live events between snapshot and live stream.
-	replay, err := m.snapshotStates(ctx, qo)
+	replay, err := m.snapshotStates(ctxSub, qo)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return nil, err
 	}
 
-	storeCh, err := m.store.Subscribe(ctx)
+	storeCh, err := m.store.Subscribe(ctxSub)
 	if err != nil {
 		return nil, err
 	}
